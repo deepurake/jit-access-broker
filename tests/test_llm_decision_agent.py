@@ -4,7 +4,7 @@ in for a real LLM call. Each branch is asserted on recommendation,
 confidence, AND risk_flag together, since a test that only checks one field
 could pass even if the others are wrong.
 """
-from broker.triage import (
+from broker.llm_decision_agent import (
     MockTriageProvider,
     TriageConfidence,
     TriageProvider,

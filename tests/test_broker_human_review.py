@@ -3,7 +3,7 @@ Evals for the human-in-the-loop review path: Broker.request_access routing
 to a pending approval instead of auto-granting, Broker.resolve_approval
 deciding it, and Broker.sweep_pending_timeouts auto-denying stale ones.
 
-DecisionRouter (the real PolicyEngine that produces ROUTE_HUMAN) is a
+PolicyEngine (the real PolicyEngine that produces ROUTE_HUMAN) is a
 separate parallel task, so these tests drive the policy seam with a tiny
 hand-written fake instead of depending on it.
 """
@@ -24,10 +24,10 @@ from broker.models import (
     RequestStatus,
     ReturnedToRequesterError,
 )
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 
 
-class FixedPolicyEngine(PolicyEngine):
+class FixedPolicy(Policy):
     def __init__(self, decision: PolicyDecision):
         self.decision = decision
 
@@ -39,7 +39,7 @@ def make_broker(db_path, decision, clock=None, connector=None):
     clock = clock or FakeClock()
     connector = connector or MockConnector()
     db = Database(str(db_path))
-    broker = Broker(db=db, clock=clock, policy=FixedPolicyEngine(decision), connector=connector)
+    broker = Broker(db=db, clock=clock, policy=FixedPolicy(decision), connector=connector)
     return broker, clock, connector, db
 
 
@@ -207,7 +207,7 @@ def test_requester_cannot_approve_their_own_request_but_someone_else_still_can(t
     # the approval is NOT consumed: it stays PENDING for a different reviewer
     assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
     events = db.get_audit_log(request_id=pending.request_id)
-    rejected = [e for e in events if e.event_type == AuditEventType.APPROVAL_REJECTED]
+    rejected = [e for e in events if e.event_type == AuditEventType.SELF_APPROVAL_BLOCKED]
     assert len(rejected) == 1
     assert "self-approval attempt by alice" in rejected[0].detail
 
@@ -370,7 +370,7 @@ def test_sweep_pending_timeouts_does_not_touch_already_resolved_approvals(tmp_pa
 RETURNED_DECISION = PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, "reason is missing or a placeholder -- say what you need to do and why")
 
 
-class SequencePolicyEngine(PolicyEngine):
+class SequencePolicyEngine(Policy):
     """Returns the next decision on each call, so one test can drive a
     RETURNED request followed by a resubmission that is decided differently."""
 

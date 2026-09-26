@@ -1,6 +1,6 @@
 """
 Evals for the approval service: the magic-link web app a human reviewer
-lands on when the DecisionRouter routes a request to human review.
+lands on when the PolicyEngine routes a request to human review.
 
 GET /approve/<token> renders the request (read-only) so the reviewer sees
 what they're deciding on, including the AI triage justification.
@@ -23,13 +23,13 @@ from broker.models import (
     PolicyDecisionType,
     ReturnedToRequesterError,
 )
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 
 JUSTIFICATION = "reason is present but admin access for an extended duration carries elevated risk"
 REASON = "rotating leaked credentials after incident 4711"
 
 
-class FixedPolicyEngine(PolicyEngine):
+class FixedPolicy(Policy):
     def __init__(self, decision: PolicyDecision):
         self.decision = decision
 
@@ -42,7 +42,7 @@ def env(tmp_path):
     db = Database(str(tmp_path / "test.db"))
     clock = FakeClock()
     connector = MockConnector()
-    policy = FixedPolicyEngine(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, JUSTIFICATION))
+    policy = FixedPolicy(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, JUSTIFICATION))
     broker = Broker(db=db, policy=policy, connector=connector, clock=clock)
     client = create_app(broker).test_client()
     return broker, db, connector, client
@@ -249,7 +249,7 @@ def test_get_on_decide_url_does_not_decide(env):
 def test_escalated_request_page_shows_note_and_original_ai_reason(tmp_path):
     ai_reason = "reason is missing or a placeholder -- say what you need to do and why"
     db = Database(str(tmp_path / "test.db"))
-    policy = FixedPolicyEngine(PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, ai_reason))
+    policy = FixedPolicy(PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, ai_reason))
     broker = Broker(db=db, policy=policy, connector=MockConnector(), clock=FakeClock())
     client = create_app(broker).test_client()
     with pytest.raises(ReturnedToRequesterError) as exc_info:
@@ -279,7 +279,7 @@ def test_justification_shown_is_the_latest_routed_to_human_event(tmp_path):
     """An escalated request has exactly one ROUTED_TO_HUMAN, but the page is
     explicit about taking the last one so a later routing always wins."""
     db = Database(str(tmp_path / "test.db"))
-    broker = Broker(db=db, policy=FixedPolicyEngine(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "first")), connector=MockConnector(), clock=FakeClock())
+    broker = Broker(db=db, policy=FixedPolicy(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "first")), connector=MockConnector(), clock=FakeClock())
     client = create_app(broker).test_client()
     token = _route_to_human(broker)
     pending = db.get_pending_approval_by_token(token)

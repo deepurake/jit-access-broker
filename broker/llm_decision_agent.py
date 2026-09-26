@@ -20,7 +20,7 @@ the same steps, so the request -> triage -> decision pipeline is real and
 testable before any live model call exists. This is exactly the kind of
 judgment call where AI helps (reading unstructured, free-text
 justifications) but confidence must be explicit and low confidence must
-defer to a human -- see DecisionRouter (broker/decision_router.py) for how
+defer to a human -- see PolicyEngine (broker/policy_engine.py) for how
 the confidence signal actually gets used."""
 import json
 from abc import ABC, abstractmethod
@@ -444,7 +444,7 @@ class ClaudeTriageProvider(TriageProvider):
 
     Any network/API failure or unparseable response defers to a human --
     a triage provider must never fail open, and it never raises: a result
-    is always returned so DecisionRouter sees a decision, not a failure.
+    is always returned so PolicyEngine sees a decision, not a failure.
     `client` is injectable so the flow can be tested without a network."""
 
     def __init__(self, client: Optional[anthropic.Anthropic] = None) -> None:

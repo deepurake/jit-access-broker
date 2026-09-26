@@ -1,4 +1,4 @@
-"""DecisionRouter is the real PolicyEngine implementation, composing a
+"""PolicyEngine is the real Policy implementation, composing a
 UserDirectory, AclPolicyEngine, and TriageProvider. This is the ONLY place
 that combines their outputs into a final decision -- deterministic glue
 code, not another model call (the routing threshold logic itself must never
@@ -32,8 +32,8 @@ triage is skipped too: an AI APPROVE that nothing has gated must not exist.
 """
 from broker.acl_policy import AclPolicyEngine
 from broker.models import PolicyDecision, PolicyDecisionType
-from broker.policy import PolicyEngine
-from broker.triage import (
+from broker.policy import Policy
+from broker.llm_decision_agent import (
     _MIN_REASON_LENGTH,
     _NON_SUBSTANTIVE_REASONS,
     TriageConfidence,
@@ -46,7 +46,7 @@ from broker.user_directory import UserDirectory
 JUNK_REASON_MESSAGE = "reason is missing or a placeholder -- say what you need to do and why"
 
 
-class DecisionRouter(PolicyEngine):
+class PolicyEngine(Policy):
     def __init__(self, user_directory: UserDirectory, acl_engine: AclPolicyEngine, triage_provider: TriageProvider):
         self.user_directory = user_directory
         self.acl_engine = acl_engine

@@ -13,13 +13,13 @@ from broker.clock import FakeClock, SystemClock
 from broker.db import Database
 from broker.http_connector import HttpResourceConnector
 from broker.models import PolicyDecision, PolicyDecisionType
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 from protected_service.app import create_app as create_protected_app
 from protected_service.introspector import HttpIntrospector
 from sidecar.app import create_app as create_sidecar_app
 
 
-class RouteToHumanPolicy(PolicyEngine):
+class RouteToHumanPolicy(Policy):
     """Every request needs a reviewer. Lets the integration tests exercise
     the magic-link leg without depending on ACL/triage configuration."""
 

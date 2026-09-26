@@ -32,7 +32,7 @@ class AuditEventType(str, Enum):
     APPROVAL_TIMEOUT = "APPROVAL_TIMEOUT"
     # A resolve attempt that was refused without changing the approval's
     # state (e.g. a requester trying to approve their own request).
-    APPROVAL_REJECTED = "APPROVAL_REJECTED"
+    SELF_APPROVAL_BLOCKED = "SELF_APPROVAL_BLOCKED"
     # A request that never reached the policy engine because the same
     # requester already holds an ACTIVE grant / PENDING approval for the
     # same resource + access level.
@@ -78,9 +78,9 @@ class RequestStatus(str, Enum):
 class PolicyDecision:
     decision: PolicyDecisionType
     reason: str
-    # Populated by DecisionRouter only when the triage step actually ran.
+    # Populated by PolicyEngine only when the triage step actually ran.
     # Plain strings/bools (the enums' .value), not a TriageResult, so this
-    # module stays free of a dependency on broker.triage.
+    # module stays free of a dependency on broker.llm_decision_agent.
     triage_recommendation: Optional[str] = None
     triage_confidence: Optional[str] = None
     triage_risk_flag: Optional[bool] = None

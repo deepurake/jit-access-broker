@@ -1,5 +1,5 @@
 """
-Evals for DecisionRouter -- the real PolicyEngine implementation that
+Evals for PolicyEngine -- the real PolicyEngine implementation that
 composes UserDirectory, AclPolicyEngine, and TriageProvider into a final
 decision. Uses a REAL Database + DatabaseUserDirectory + AclPolicyEngine
 (seeded via the already-tested db.set_user_role / db.load_acl_rules), and
@@ -10,9 +10,9 @@ cases).
 """
 from broker.acl_policy import AclPolicyEngine
 from broker.db import Database
-from broker.decision_router import DecisionRouter
+from broker.policy_engine import PolicyEngine
 from broker.models import PolicyDecisionType
-from broker.triage import (
+from broker.llm_decision_agent import (
     MockTriageProvider,
     TriageConfidence,
     TriageProvider,
@@ -44,7 +44,7 @@ def make_router(tmp_path, rules, triage_provider):
     db.load_acl_rules(rules)
     user_directory = DatabaseUserDirectory(db)
     acl_engine = AclPolicyEngine(db)
-    return DecisionRouter(user_directory, acl_engine, triage_provider), db
+    return PolicyEngine(user_directory, acl_engine, triage_provider), db
 
 
 def test_acl_deny_short_circuits_before_triage_is_ever_called(tmp_path):
@@ -467,7 +467,7 @@ def test_triage_failure_routes_to_human_instead_of_crashing(tmp_path):
 
 def test_user_directory_failure_routes_to_human_instead_of_denying(tmp_path):
     db = Database(str(tmp_path / "test.db"))
-    router = DecisionRouter(ExplodingUserDirectory(), AclPolicyEngine(db), MockTriageProvider())
+    router = PolicyEngine(ExplodingUserDirectory(), AclPolicyEngine(db), MockTriageProvider())
 
     decision = router.decide(
         requester="ivan", resource="prod-db", access_level="read", duration_seconds=600, reason="investigating an alert"
@@ -488,7 +488,7 @@ def test_acl_engine_failure_routes_to_human_and_skips_triage(tmp_path):
     )
     db = Database(str(tmp_path / "test.db"))
     db.set_user_role("ivan", "engineer")
-    router = DecisionRouter(DatabaseUserDirectory(db), ExplodingAclEngine(), fake_triage)
+    router = PolicyEngine(DatabaseUserDirectory(db), ExplodingAclEngine(), fake_triage)
 
     decision = router.decide(
         requester="ivan", resource="prod-db", access_level="read", duration_seconds=600, reason="investigating an alert"

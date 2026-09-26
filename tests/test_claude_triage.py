@@ -1,7 +1,7 @@
 """
 Evals for ClaudeTriageProvider -- the real LLM-backed TriageProvider.
 
-Split into two groups, matching the split in broker/triage.py:
+Split into two groups, matching the split in broker/llm_decision_agent.py:
 
 1. Tests of `_parse_triage_response`, the pure text-in/TriageResult-out
    parser. These need no network access and no API key, so they always run
@@ -17,7 +17,7 @@ import os
 import anthropic
 import pytest
 
-from broker.triage import (
+from broker.llm_decision_agent import (
     ClaudeTriageProvider,
     TriageConfidence,
     TriageProvider,

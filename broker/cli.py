@@ -12,20 +12,20 @@ from broker.acl_policy import AclPolicyEngine
 from broker.broker import Broker
 from broker.connector import MockConnector
 from broker.db import Database
-from broker.decision_router import DecisionRouter
+from broker.policy_engine import PolicyEngine
 from broker.http_connector import HttpResourceConnector
 from broker.models import AccessDeniedError, DuplicateRequestError, PendingApproval, PendingHumanReviewError, ReturnedToRequesterError
-from broker.triage import ClaudeTriageProvider, MockTriageProvider
+from broker.llm_decision_agent import ClaudeTriageProvider, MockTriageProvider
 from broker.user_directory import DatabaseUserDirectory
 
 
 def build_broker(db_path: str, triage: str = "mock", sidecar_url: Optional[str] = None) -> Broker:
     """Wires the real decision pipeline: user_roles -> ACL ceiling -> triage
-    -> DecisionRouter. Only the triage backend and the resource connector are
+    -> PolicyEngine. Only the triage backend and the resource connector are
     swappable from the command line; the routing logic itself is fixed."""
     db = Database(db_path)
     triage_provider = ClaudeTriageProvider() if triage == "claude" else MockTriageProvider()
-    policy = DecisionRouter(
+    policy = PolicyEngine(
         user_directory=DatabaseUserDirectory(db),
         acl_engine=AclPolicyEngine(db),
         triage_provider=triage_provider,

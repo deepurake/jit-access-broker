@@ -21,10 +21,10 @@ from broker.models import (
     RequestStatus,
     ReturnedToRequesterError,
 )
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 
 
-class CountingPolicyEngine(PolicyEngine):
+class CountingPolicy(Policy):
     """Returns a fixed decision and counts how often it was asked -- the
     assertion that matters here is that duplicates never reach it."""
 
@@ -45,7 +45,7 @@ def make_broker(db_path, decision):
     clock = FakeClock()
     connector = MockConnector()
     db = Database(str(db_path))
-    policy = CountingPolicyEngine(decision)
+    policy = CountingPolicy(decision)
     broker = Broker(db=db, clock=clock, policy=policy, connector=connector)
     return broker, clock, connector, db, policy
 

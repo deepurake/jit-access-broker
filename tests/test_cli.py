@@ -11,10 +11,10 @@ from broker.cli import build_parser, cmd_request, main
 from broker.connector import MockConnector
 from broker.db import Database
 from broker.models import PolicyDecision, PolicyDecisionType
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 
 
-class FixedPolicyEngine(PolicyEngine):
+class FixedPolicy(Policy):
     def __init__(self, decision: PolicyDecision):
         self.decision = decision
 
@@ -237,7 +237,7 @@ def test_request_command_reports_pending_human_review(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     broker = Broker(
         db=Database(str(db_path)),
-        policy=FixedPolicyEngine(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")),
+        policy=FixedPolicy(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")),
         connector=MockConnector(),
     )
     args = build_parser().parse_args(

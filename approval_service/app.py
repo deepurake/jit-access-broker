@@ -1,5 +1,5 @@
 """The human-review half of the JIT broker: a magic-link web app. A request
-the DecisionRouter couldn't confidently auto-approve lands here as a
+the PolicyEngine couldn't confidently auto-approve lands here as a
 single-use URL. GET renders what's being asked (including the AI triage
 justification) so the reviewer can decide; the decision itself is a POST so
 a bare link can never approve access on its own. No login -- the unguessable

@@ -20,7 +20,7 @@ from broker.models import (
     RequestStatus,
     ReturnedToRequesterError,
 )
-from broker.policy import PolicyEngine
+from broker.policy import Policy
 
 # What the requester is told they can do with a RETURNED request. Goes into
 # the exception (for the CLI) and into the audit detail (so the log shows
@@ -29,7 +29,7 @@ RETURN_HINT = "fix the reason and resubmit, or escalate this request to a human 
 
 
 class Broker:
-    def __init__(self, db: Database, policy: PolicyEngine, connector: ResourceConnector, clock=None, approval_deadline_seconds: int = 14400):
+    def __init__(self, db: Database, policy: Policy, connector: ResourceConnector, clock=None, approval_deadline_seconds: int = 14400):
         self.db = db
         self.policy = policy
         self.connector = connector
@@ -165,7 +165,7 @@ class Broker:
         # Self-approval is refused WITHOUT consuming the approval: the link
         # stays PENDING so a different reviewer can still decide it.
         if decided_by.strip() == request.requester:
-            self.db.append_audit(request.id, None, AuditEventType.APPROVAL_REJECTED, f"self-approval attempt by {request.requester}", now)
+            self.db.append_audit(request.id, None, AuditEventType.SELF_APPROVAL_BLOCKED, f"self-approval attempt by {request.requester}", now)
             return ApprovalResolution(resolved=False, grant=None, reason="requesters cannot approve their own request")
 
         new_status = PendingApprovalStatus.APPROVED if approve else PendingApprovalStatus.DENIED
