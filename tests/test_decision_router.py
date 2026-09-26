@@ -18,6 +18,8 @@ from broker.triage import (
     TriageProvider,
     TriageRecommendation,
     TriageResult,
+    TriageStep,
+    TriageStepName,
 )
 from broker.user_directory import DatabaseUserDirectory
 
@@ -205,7 +207,9 @@ def test_medium_confidence_approve_is_not_high_enough_to_auto_approve(tmp_path):
     assert decision.reason == "probably fine but not certain"
 
 
-def test_end_to_end_with_real_mock_triage_provider_vague_reason_routes_to_human(tmp_path):
+def test_end_to_end_with_real_mock_triage_provider_placeholder_reason_is_returned_to_requester(tmp_path):
+    # "testing" is in the placeholder set, so the deterministic junk gate
+    # returns it to the requester before any triage runs.
     router, db = make_router(
         tmp_path,
         rules=[{"role": "engineer", "resource_pattern": "prod-db", "max_access_level": "read", "max_duration_seconds": 3600}],
@@ -217,8 +221,186 @@ def test_end_to_end_with_real_mock_triage_provider_vague_reason_routes_to_human(
         requester="gina", resource="prod-db", access_level="read", duration_seconds=600, reason="testing"
     )
 
+    assert decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER
+    assert "placeholder" in decision.reason
+    assert decision.triage_recommendation is None
+
+
+def test_end_to_end_with_real_mock_triage_provider_irrelevant_reason_for_admin_is_returned_to_requester(tmp_path):
+    # Substantive wording, so it clears the junk gate and triage runs -- but
+    # step 1 finds it describes no change to make, which cannot justify admin.
+    router, db = make_router(
+        tmp_path,
+        rules=[{"role": "oncall", "resource_pattern": "prod-*", "max_access_level": "admin", "max_duration_seconds": 7200}],
+        triage_provider=MockTriageProvider(),
+    )
+    db.set_user_role("gina", "oncall")
+
+    decision = router.decide(
+        requester="gina",
+        resource="prod-db",
+        access_level="admin",
+        duration_seconds=600,
+        reason="I want to look at the dashboards for a while",
+    )
+
+    assert decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER
+    assert "does not justify admin" in decision.reason
+    # triage DID run here, so its signal must survive for the TRIAGED audit
+    assert decision.triage_recommendation == "DENY"
+    assert decision.triage_confidence == "LOW"
+    assert decision.triage_risk_flag is True
+    assert decision.triage_justification == decision.reason
+
+
+# --- Return-to-requester: an insufficient reason is the requester's problem
+# to fix, not the approver's. Two rules produce it: a deterministic junk gate
+# that runs BEFORE triage (no model cost, no approver time), and a failed
+# triage step 1 ("this reason does not justify this permission"). Over-scope,
+# risk flags, low confidence, and system failures still go to a human.
+
+
+def _fake_high_approve():
+    return FakeTriageProvider(
+        TriageResult(
+            recommendation=TriageRecommendation.APPROVE,
+            confidence=TriageConfidence.HIGH,
+            justification="should never be seen",
+            risk_flag=False,
+        )
+    )
+
+
+ENGINEER_READ_RULES = [
+    {"role": "engineer", "resource_pattern": "prod-db", "max_access_level": "read", "max_duration_seconds": 3600}
+]
+
+
+def test_placeholder_reason_is_returned_to_requester_without_calling_triage(tmp_path):
+    fake_triage = _fake_high_approve()
+    router, db = make_router(tmp_path, rules=ENGINEER_READ_RULES, triage_provider=fake_triage)
+    db.set_user_role("jane", "engineer")
+
+    decision = router.decide(
+        requester="jane", resource="prod-db", access_level="read", duration_seconds=600, reason="  IDK "
+    )
+
+    assert decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER
+    assert "placeholder" in decision.reason
+    assert fake_triage.calls == []
+    assert decision.triage_recommendation is None
+    assert decision.triage_confidence is None
+    assert decision.triage_risk_flag is None
+    assert decision.triage_justification is None
+
+
+def test_too_short_reason_is_returned_to_requester_without_calling_triage(tmp_path):
+    fake_triage = _fake_high_approve()
+    router, db = make_router(tmp_path, rules=ENGINEER_READ_RULES, triage_provider=fake_triage)
+    db.set_user_role("jane", "engineer")
+
+    decision = router.decide(
+        requester="jane", resource="prod-db", access_level="read", duration_seconds=600, reason="ops stuff"
+    )
+
+    assert decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER
+    assert fake_triage.calls == []
+    assert decision.triage_recommendation is None
+
+
+def test_junk_gate_runs_after_acl_so_a_denied_requester_still_sees_deny(tmp_path):
+    # ACL deny is a hard stop and comes first: a requester with no role gets
+    # DENY, not "fix your reason", even when the reason is junk.
+    fake_triage = _fake_high_approve()
+    router, _db = make_router(tmp_path, rules=[], triage_provider=fake_triage)
+
+    decision = router.decide(
+        requester="nobody", resource="prod-db", access_level="read", duration_seconds=600, reason="idk"
+    )
+
+    assert decision.decision == PolicyDecisionType.DENY
+    assert fake_triage.calls == []
+
+
+def test_failed_reason_validation_step_is_returned_to_requester_with_triage_fields(tmp_path):
+    fake_triage = FakeTriageProvider(
+        TriageResult(
+            recommendation=TriageRecommendation.DENY,
+            confidence=TriageConfidence.LOW,
+            justification="reason does not justify write access: it describes no change to make",
+            risk_flag=True,
+            steps=[
+                TriageStep(
+                    TriageStepName.REASON_VALIDATION,
+                    False,
+                    "reason does not justify write access: it describes no change to make",
+                )
+            ],
+        )
+    )
+    router, db = make_router(
+        tmp_path,
+        rules=[{"role": "oncall", "resource_pattern": "prod-*", "max_access_level": "admin", "max_duration_seconds": 7200}],
+        triage_provider=fake_triage,
+    )
+    db.set_user_role("kim", "oncall")
+
+    decision = router.decide(
+        requester="kim", resource="prod-db", access_level="write", duration_seconds=600, reason="checking the replication lag graphs"
+    )
+
+    assert decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER
+    assert decision.reason == "reason does not justify write access: it describes no change to make"
+    assert len(fake_triage.calls) == 1
+    assert decision.triage_recommendation == "DENY"
+    assert decision.triage_confidence == "LOW"
+    assert decision.triage_risk_flag is True
+
+
+def test_stepless_deny_from_a_provider_without_steps_still_routes_to_human(tmp_path):
+    # A TriageResult with no steps carries no "step 1 failed" signal, so the
+    # pre-existing rule applies: AI never gets unilateral deny authority.
+    fake_triage = FakeTriageProvider(
+        TriageResult(
+            recommendation=TriageRecommendation.DENY,
+            confidence=TriageConfidence.LOW,
+            justification="reason does not appear substantive",
+            risk_flag=True,
+        )
+    )
+    router, db = make_router(tmp_path, rules=ENGINEER_READ_RULES, triage_provider=fake_triage)
+    db.set_user_role("lee", "engineer")
+
+    decision = router.decide(
+        requester="lee", resource="prod-db", access_level="read", duration_seconds=600, reason="debugging an incident"
+    )
+
     assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
-    assert "not appear substantive" in decision.reason
+    assert decision.reason == "reason does not appear substantive"
+
+
+def test_passed_step_one_but_failed_scope_step_still_routes_to_human(tmp_path):
+    # oncall may hold admin/7200 and the reason is substantive and mutating,
+    # so step 1 passes; step 2 flags the extended admin scope. Least privilege
+    # is the approver's call, not a wording fix -> human, not returned.
+    router, db = make_router(
+        tmp_path,
+        rules=[{"role": "oncall", "resource_pattern": "prod-*", "max_access_level": "admin", "max_duration_seconds": 7200}],
+        triage_provider=MockTriageProvider(),
+    )
+    db.set_user_role("mia", "oncall")
+
+    decision = router.decide(
+        requester="mia",
+        resource="prod-db",
+        access_level="admin",
+        duration_seconds=7200,
+        reason="rotating leaked credentials after incident 4711",
+    )
+
+    assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
+    assert decision.triage_recommendation == "APPROVE"
+    assert decision.triage_risk_flag is True
 
 
 def test_end_to_end_with_real_mock_triage_provider_substantive_reason_is_auto_approved(tmp_path):

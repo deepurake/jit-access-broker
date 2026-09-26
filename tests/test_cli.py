@@ -232,7 +232,7 @@ def test_audit_has_no_triaged_event_when_acl_denies_before_triage(tmp_path, caps
 def test_request_command_reports_pending_human_review(tmp_path, capsys):
     """Drives cmd_request directly against a hand-built Broker with a fixed
     ROUTE_HUMAN policy, isolating the command's PENDING_HUMAN output format
-    from the real pipeline (which test_request_with_vague_reason_routes_to_human_via_main
+    from the real pipeline (which test_risk_flag_routes_otherwise_permitted_request_to_human
     covers end to end through main())."""
     db_path = tmp_path / "cli.db"
     broker = Broker(
@@ -374,17 +374,117 @@ def test_request_exceeding_acl_ceiling_is_denied(tmp_path, capsys):
     assert "capped" in parse_field(output, "detail")
 
 
-def test_request_with_vague_reason_routes_to_human_via_main(tmp_path, capsys):
+def test_request_with_placeholder_reason_is_returned_to_requester_via_main(tmp_path, capsys):
+    """A junk reason never reaches an approver: it goes back to the requester
+    with a hint and the exact escalate command, and no model ran."""
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys)
 
     exit_code = main(request_grant(db_path, reason="idk"))
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "RETURNED"
+    assert parse_field(output, "request_id") == "1"
+    assert "placeholder" in parse_field(output, "detail")
+    assert "resubmit" in parse_field(output, "hint")
+    assert parse_field(output, "escalate_with") == f'python -m broker.cli --db {db_path} escalate 1 --by alice --note "..."'
+    assert "approval_token" not in output
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    event_types = re.findall(r"event=(\w+)", capsys.readouterr().out)
+    assert event_types == ["REQUESTED", "POLICY_DECIDED", "RETURNED_TO_REQUESTER"]
+
+
+def test_request_with_irrelevant_reason_for_admin_is_returned_after_triage(tmp_path, capsys):
+    """Substantive wording clears the junk gate, so triage runs (TRIAGED is
+    audited) -- but step 1 says it doesn't justify admin, so it is returned."""
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+
+    exit_code = main(
+        request_grant(db_path, **{"access-level": "admin"}, duration="600", reason="I want to look at the dashboards for a while")
+    )
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "RETURNED"
+    assert "does not justify admin" in parse_field(output, "detail")
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    event_types = re.findall(r"event=(\w+)", capsys.readouterr().out)
+    assert event_types == ["REQUESTED", "TRIAGED", "POLICY_DECIDED", "RETURNED_TO_REQUESTER"]
+
+
+def test_escalate_command_turns_a_returned_request_into_a_pending_review(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path, reason="idk"))
+    capsys.readouterr()
+
+    exit_code = main(["--db", str(db_path), "escalate", "1", "--by", "alice", "--note", "on-call, checking replication lag, ticket OPS-77"])
 
     assert exit_code == 0
     output = capsys.readouterr().out
     assert parse_field(output, "status") == "PENDING_HUMAN"
     token = parse_field(output, "approval_token")
     assert parse_field(output, "approval_url") == f"http://localhost:8083/approve/{token}"
+    assert parse_field(output, "deadline_at").isdigit()
+
+    main(["--db", str(db_path), "show-request", "1"])
+    assert parse_field(capsys.readouterr().out, "status") == "PENDING_HUMAN"
+
+
+def test_escalate_command_by_someone_else_fails(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path, reason="idk"))
+    capsys.readouterr()
+
+    exit_code = main(["--db", str(db_path), "escalate", "1", "--by", "mallory", "--note", "let me in"])
+
+    assert exit_code == 1
+    assert capsys.readouterr().out.strip() == "error: request 1 cannot be escalated (not found, not returned, or not yours)"
+    main(["--db", str(db_path), "show-request", "1"])
+    assert parse_field(capsys.readouterr().out, "status") == "RETURNED"
+
+
+def test_escalate_command_on_unknown_request_fails(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "escalate", "42", "--by", "alice", "--note", "?"])
+
+    assert exit_code == 1
+    assert capsys.readouterr().out.startswith("error: request 42 cannot be escalated")
+
+
+def test_full_return_escalate_approve_loop_via_cli(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+
+    assert main(request_grant(db_path, reason="idk")) == 1
+    assert parse_field(capsys.readouterr().out, "status") == "RETURNED"
+
+    assert main(["--db", str(db_path), "escalate", "1", "--by", "alice", "--note", "ticket OPS-77"]) == 0
+    token = parse_field(capsys.readouterr().out, "approval_token")
+
+    assert main(["--db", str(db_path), "approve", token, "--by", "bob", "--decision", "approve"]) == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "resolved") == "true"
+    grant_id = parse_field(output, "grant_id")
+
+    main(["--db", str(db_path), "status", grant_id])
+    output = capsys.readouterr().out
+    assert parse_field(output, "active") == "true"
+    assert parse_field(output, "status") == "ACTIVE"
+
+    main(["--db", str(db_path), "show-request", "1"])
+    assert parse_field(capsys.readouterr().out, "status") == "HUMAN_APPROVED"
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    event_types = re.findall(r"event=(\w+)", capsys.readouterr().out)
+    # no TRIAGED: the junk gate returned it before any model ran
+    assert event_types == ["REQUESTED", "POLICY_DECIDED", "RETURNED_TO_REQUESTER", "ESCALATED", "ROUTED_TO_HUMAN", "HUMAN_APPROVED"]
 
 
 def test_risk_flag_routes_otherwise_permitted_request_to_human(tmp_path, capsys):

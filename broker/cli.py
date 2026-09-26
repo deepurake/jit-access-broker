@@ -14,7 +14,7 @@ from broker.connector import MockConnector
 from broker.db import Database
 from broker.decision_router import DecisionRouter
 from broker.http_connector import HttpResourceConnector
-from broker.models import AccessDeniedError, DuplicateRequestError, PendingHumanReviewError
+from broker.models import AccessDeniedError, DuplicateRequestError, PendingApproval, PendingHumanReviewError, ReturnedToRequesterError
 from broker.triage import ClaudeTriageProvider, MockTriageProvider
 from broker.user_directory import DatabaseUserDirectory
 
@@ -43,6 +43,15 @@ def _require_grant(broker: Broker, grant_id: int):
     return grant
 
 
+def _print_pending(args, pending: PendingApproval) -> None:
+    """The PENDING_HUMAN block, identical whether the router or an
+    escalation put the request in front of a reviewer."""
+    print("status: PENDING_HUMAN")
+    print(f"approval_token: {pending.approval_token}")
+    print(f"approval_url: {args.approval_base_url}/approve/{pending.approval_token}")
+    print(f"deadline_at: {pending.deadline_at}")
+
+
 def cmd_request(args, broker: Broker) -> int:
     try:
         grant = broker.request_access(
@@ -56,6 +65,16 @@ def cmd_request(args, broker: Broker) -> int:
         print(f"status: {e.decision.decision.value}")
         print(f"detail: {e.decision.reason}")
         return 1
+    except ReturnedToRequesterError as e:
+        # Exit 1 like a deny (no access was granted), but the output says
+        # what the requester can do about it -- including the exact command
+        # to escalate this very request if they think a human should see it.
+        print("status: RETURNED")
+        print(f"request_id: {e.request_id}")
+        print(f"detail: {e.decision.reason}")
+        print(f"hint: {e.hint}")
+        print(f'escalate_with: python -m broker.cli --db {args.db} escalate {e.request_id} --by {args.requester} --note "..."')
+        return 1
     except DuplicateRequestError as e:
         print("status: DUPLICATE")
         print(f"detail: {e}")
@@ -65,11 +84,7 @@ def cmd_request(args, broker: Broker) -> int:
             print(f"existing_approval_token: {e.existing_pending.approval_token}")
         return 1
     except PendingHumanReviewError as e:
-        pending = e.pending_approval
-        print("status: PENDING_HUMAN")
-        print(f"approval_token: {pending.approval_token}")
-        print(f"approval_url: {args.approval_base_url}/approve/{pending.approval_token}")
-        print(f"deadline_at: {pending.deadline_at}")
+        _print_pending(args, e.pending_approval)
         return 0
 
     print(f"status: {grant.status.value}")
@@ -129,6 +144,19 @@ def cmd_approve(args, broker: Broker) -> int:
     if resolution.grant is not None:
         print(f"grant_id: {resolution.grant.id}")
         print(f"token: {resolution.grant.token}")
+    return 0
+
+
+def cmd_escalate(args, broker: Broker) -> int:
+    """The requester's answer to a RETURNED request when they believe a
+    human should see it anyway. Only the requester can escalate, and only a
+    RETURNED request -- everything else is one generic error so the command
+    can't be used to probe which request ids exist or whose they are."""
+    pending = broker.escalate(args.request_id, note=args.note, requested_by=args.by)
+    if pending is None:
+        print(f"error: request {args.request_id} cannot be escalated (not found, not returned, or not yours)")
+        return 1
+    _print_pending(args, pending)
     return 0
 
 
@@ -235,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_approve.add_argument("--by", required=True, help="who is deciding")
     p_approve.add_argument("--decision", choices=["approve", "deny"], required=True)
     p_approve.set_defaults(func=cmd_approve)
+
+    p_escalate = sub.add_parser("escalate", help="send a request the AI returned to you to a human reviewer instead")
+    p_escalate.add_argument("request_id", type=int)
+    p_escalate.add_argument("--by", required=True, help="who is escalating (must be the requester)")
+    p_escalate.add_argument("--note", required=True, help="what the reviewer should know that the original reason didn't say")
+    p_escalate.set_defaults(func=cmd_escalate)
 
     p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules table")
     p_load_acl.add_argument("path", help="path to the acl.yaml file")

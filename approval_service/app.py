@@ -42,6 +42,9 @@ REVIEW_PAGE = """<!doctype html>
   </dl>
 
   <h2>Why this needs a human</h2>
+  {% if escalation_note is not none %}
+  <p><strong>Escalated by the requester: {{ escalation_note }}</strong></p>
+  {% endif %}
   <p>The AI triage step did not auto-approve this request. Its justification:</p>
   <blockquote>{{ justification }}</blockquote>
 
@@ -86,11 +89,18 @@ def create_app(broker: Broker) -> Flask:
             abort(404)
         req = broker.db.get_request(pending.request_id)
 
+        # The LAST ROUTED_TO_HUMAN event is the one this approval came from
+        # (get_audit_log is ordered by id, so iterating without a break keeps
+        # the latest). An escalated request has exactly one, carrying what
+        # the AI originally objected to; the ESCALATED event (if any) is the
+        # requester's own note explaining why a human should look anyway.
         justification = NO_JUSTIFICATION
+        escalation_note = None
         for event in broker.db.get_audit_log(request_id=pending.request_id):
             if event.event_type == AuditEventType.ROUTED_TO_HUMAN:
                 justification = event.detail
-                break
+            elif event.event_type == AuditEventType.ESCALATED:
+                escalation_note = event.detail.split(": ", 1)[-1]
 
         return render_template_string(
             REVIEW_PAGE,
@@ -98,6 +108,7 @@ def create_app(broker: Broker) -> Flask:
             pending=pending,
             req=req,
             justification=justification,
+            escalation_note=escalation_note,
             PendingApprovalStatus=PendingApprovalStatus,
         )
 
@@ -141,4 +152,6 @@ if __name__ == "__main__":
     # process was running gets torn down / auto-denied before we serve a
     # single click, instead of waiting for the next sweeper pass.
     broker.reconcile()
-    create_app(broker).run(host="0.0.0.0", port=8083)
+    # The Database holds one SQLite connection; the dev server must not run
+    # requests concurrently on it.
+    create_app(broker).run(host="0.0.0.0", port=8083, threaded=False)

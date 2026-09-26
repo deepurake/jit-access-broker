@@ -13,6 +13,10 @@ class PolicyDecisionType(str, Enum):
     AUTO_APPROVE = "AUTO_APPROVE"
     ROUTE_HUMAN = "ROUTE_HUMAN"
     DENY = "DENY"
+    # The stated reason is missing, a placeholder, or does not justify the
+    # requested permission. Only the requester can fix that, so it goes back
+    # to them (resubmit, or escalate to a human) instead of to an approver.
+    RETURN_TO_REQUESTER = "RETURN_TO_REQUESTER"
 
 
 class AuditEventType(str, Enum):
@@ -36,6 +40,12 @@ class AuditEventType(str, Enum):
     # What the AI triage step recommended and how sure it was, recorded so
     # the log shows WHY the router decided what it did, not just what.
     TRIAGED = "TRIAGED"
+    # The policy handed the request back to its requester (insufficient
+    # reason) instead of to an approver.
+    RETURNED_TO_REQUESTER = "RETURNED_TO_REQUESTER"
+    # The requester chose to push a RETURNED request to a human reviewer
+    # anyway. Always followed by ROUTED_TO_HUMAN.
+    ESCALATED = "ESCALATED"
 
 
 class PendingApprovalStatus(str, Enum):
@@ -57,6 +67,11 @@ class RequestStatus(str, Enum):
     HUMAN_APPROVED = "HUMAN_APPROVED"
     HUMAN_DENIED = "HUMAN_DENIED"
     TIMED_OUT = "TIMED_OUT"
+    # Terminal for the policy, but not for the requester: they may resubmit
+    # with a better reason (a RETURNED request is neither an active grant nor
+    # a pending approval, so it never counts as a duplicate) or escalate it
+    # to a human reviewer, which moves it to PENDING_HUMAN.
+    RETURNED = "RETURNED"
 
 
 @dataclass
@@ -80,6 +95,20 @@ class AccessDeniedError(Exception):
     def __init__(self, decision: PolicyDecision):
         super().__init__(decision.reason)
         self.decision = decision
+
+
+class ReturnedToRequesterError(Exception):
+    """Raised by Broker.request_access when the policy engine hands the
+    request back to the requester because the stated reason is insufficient.
+    Not a denial: `hint` tells the requester what they can do next (resubmit
+    with a real reason, or escalate to a human), and `request_id` is what
+    they need to escalate."""
+
+    def __init__(self, request_id: int, decision: PolicyDecision, hint: str):
+        super().__init__(decision.reason)
+        self.request_id = request_id
+        self.decision = decision
+        self.hint = hint
 
 
 @dataclass

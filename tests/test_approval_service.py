@@ -16,10 +16,12 @@ from broker.clock import FakeClock
 from broker.connector import MockConnector
 from broker.db import Database
 from broker.models import (
+    AuditEventType,
     PendingApprovalStatus,
     PendingHumanReviewError,
     PolicyDecision,
     PolicyDecisionType,
+    ReturnedToRequesterError,
 )
 from broker.policy import PolicyEngine
 
@@ -237,3 +239,53 @@ def test_get_on_decide_url_does_not_decide(env):
     assert resp.status_code == 405
     assert connector.issued == []
     assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.PENDING
+
+
+# -- escalated requests: the page shows the requester's note AND what the AI
+# objected to, so the reviewer knows both why it's in front of them and why
+# the AI didn't want it there.
+
+
+def test_escalated_request_page_shows_note_and_original_ai_reason(tmp_path):
+    ai_reason = "reason is missing or a placeholder -- say what you need to do and why"
+    db = Database(str(tmp_path / "test.db"))
+    policy = FixedPolicyEngine(PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, ai_reason))
+    broker = Broker(db=db, policy=policy, connector=MockConnector(), clock=FakeClock())
+    client = create_app(broker).test_client()
+    with pytest.raises(ReturnedToRequesterError) as exc_info:
+        broker.request_access(requester="alice", resource="prod-db", access_level="admin", duration_seconds=7200, reason="idk")
+    pending = broker.escalate(exc_info.value.request_id, note="on-call, checking replication lag, ticket OPS-77", requested_by="alice")
+
+    resp = client.get(f"/approve/{pending.approval_token}")
+
+    assert resp.status_code == 200
+    assert b"Escalated by the requester: on-call, checking replication lag, ticket OPS-77" in resp.data
+    assert b"escalated by requester; AI returned it because: " + ai_reason.encode() in resp.data
+    # the hint aimed at the requester is not what the reviewer is shown
+    assert b"fix the reason and resubmit" not in resp.data
+    assert b"<form" in resp.data
+
+
+def test_non_escalated_request_page_has_no_escalation_line(env):
+    broker, db, connector, client = env
+    token = _route_to_human(broker)
+
+    resp = client.get(f"/approve/{token}")
+
+    assert b"Escalated by the requester" not in resp.data
+
+
+def test_justification_shown_is_the_latest_routed_to_human_event(tmp_path):
+    """An escalated request has exactly one ROUTED_TO_HUMAN, but the page is
+    explicit about taking the last one so a later routing always wins."""
+    db = Database(str(tmp_path / "test.db"))
+    broker = Broker(db=db, policy=FixedPolicyEngine(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "first")), connector=MockConnector(), clock=FakeClock())
+    client = create_app(broker).test_client()
+    token = _route_to_human(broker)
+    pending = db.get_pending_approval_by_token(token)
+    db.append_audit(pending.request_id, None, AuditEventType.ROUTED_TO_HUMAN, "second, later routing", broker.clock.now())
+
+    resp = client.get(f"/approve/{token}")
+
+    assert b"second, later routing" in resp.data
+    assert b"<blockquote>first</blockquote>" not in resp.data

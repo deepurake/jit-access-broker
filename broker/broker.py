@@ -2,6 +2,7 @@
 one place that knows the full lifecycle; Database, PolicyEngine, and
 ResourceConnector are all interchangeable behind their own seams."""
 import secrets
+from typing import Optional
 
 from broker.clock import SystemClock
 from broker.connector import ResourceConnector
@@ -12,12 +13,19 @@ from broker.models import (
     AuditEventType,
     DuplicateRequestError,
     Grant,
+    PendingApproval,
     PendingApprovalStatus,
     PendingHumanReviewError,
     PolicyDecisionType,
     RequestStatus,
+    ReturnedToRequesterError,
 )
 from broker.policy import PolicyEngine
+
+# What the requester is told they can do with a RETURNED request. Goes into
+# the exception (for the CLI) and into the audit detail (so the log shows
+# the requester was told their options, not just refused).
+RETURN_HINT = "fix the reason and resubmit, or escalate this request to a human reviewer"
 
 
 class Broker:
@@ -69,12 +77,18 @@ class Broker:
             self.db.append_audit(request_id, None, AuditEventType.DENIED, decision.reason, now)
             raise AccessDeniedError(decision)
 
+        if decision.decision == PolicyDecisionType.RETURN_TO_REQUESTER:
+            # Not a denial and not a review: the reason is insufficient and
+            # only the requester can fix that. No approver is involved unless
+            # the requester escalates (see escalate()).
+            self.db.set_request_status(request_id, RequestStatus.RETURNED)
+            self.db.append_audit(
+                request_id, None, AuditEventType.RETURNED_TO_REQUESTER, f"{decision.reason}; hint: {RETURN_HINT}", now
+            )
+            raise ReturnedToRequesterError(request_id, decision, RETURN_HINT)
+
         if decision.decision == PolicyDecisionType.ROUTE_HUMAN:
-            approval_token = secrets.token_urlsafe(32)
-            deadline_at = now + self.approval_deadline_seconds
-            pending = self.db.create_pending_approval(request_id, approval_token, created_at=now, deadline_at=deadline_at)
-            self.db.set_request_status(request_id, RequestStatus.PENDING_HUMAN)
-            self.db.append_audit(request_id, None, AuditEventType.ROUTED_TO_HUMAN, decision.reason, now)
+            pending = self._route_to_human(request_id, decision.reason, now)
             raise PendingHumanReviewError(pending)
 
         self.db.set_request_status(request_id, RequestStatus.AUTO_APPROVED)
@@ -90,6 +104,47 @@ class Broker:
         )
         self.db.append_audit(request_id, grant.id, AuditEventType.GRANTED, f"granted until {grant.expires_at}", now)
         return grant
+
+    def _route_to_human(self, request_id: int, why: str, now: int) -> PendingApproval:
+        """The one place a pending approval is created: mints the single-use
+        token, sets the deadline, moves the request to PENDING_HUMAN and
+        audits ROUTED_TO_HUMAN with `why` (what the reviewer will be shown as
+        the justification). Used by the policy's ROUTE_HUMAN path and by a
+        requester's escalation so both produce an identical approval."""
+        approval_token = secrets.token_urlsafe(32)
+        deadline_at = now + self.approval_deadline_seconds
+        pending = self.db.create_pending_approval(request_id, approval_token, created_at=now, deadline_at=deadline_at)
+        self.db.set_request_status(request_id, RequestStatus.PENDING_HUMAN)
+        self.db.append_audit(request_id, None, AuditEventType.ROUTED_TO_HUMAN, why, now)
+        return pending
+
+    def escalate(self, request_id: int, note: str, requested_by: str) -> Optional[PendingApproval]:
+        """Pushes a RETURNED request in front of a human reviewer anyway, at
+        the requester's own choice. Returns the new PendingApproval, or None
+        when there is nothing to escalate: unknown request, a request in any
+        status other than RETURNED (already pending, already decided, a
+        duplicate), or a caller who is not the requester -- only the person
+        the AI returned it to gets to say "a human should look at this".
+        Escalating twice therefore fails the second time: the first call
+        moved the request to PENDING_HUMAN."""
+        request = self.db.get_request(request_id)
+        if request is None or request.status != RequestStatus.RETURNED:
+            return None
+        if requested_by.strip() != request.requester:
+            return None
+
+        now = self.clock.now()
+        # The reviewer should see what the AI objected to, not just that the
+        # requester insisted. The original reason is the RETURNED_TO_REQUESTER
+        # audit detail, minus the hint appended for the requester's benefit.
+        original_reason = "(no reason recorded)"
+        for event in self.db.get_audit_log(request_id=request_id):
+            if event.event_type == AuditEventType.RETURNED_TO_REQUESTER:
+                original_reason = event.detail.split(f"; hint: {RETURN_HINT}", 1)[0]
+        self.db.append_audit(request_id, None, AuditEventType.ESCALATED, f"escalated by {requested_by}: {note}", now)
+        return self._route_to_human(
+            request_id, f"escalated by requester; AI returned it because: {original_reason}", now
+        )
 
     def resolve_approval(self, approval_token: str, approve: bool, decided_by: str) -> ApprovalResolution:
         # Enforce deadlines at click time, not just when a sweeper happens to

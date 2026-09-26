@@ -22,6 +22,7 @@ from broker.models import (
     PolicyDecision,
     PolicyDecisionType,
     RequestStatus,
+    ReturnedToRequesterError,
 )
 from broker.policy import PolicyEngine
 
@@ -357,3 +358,174 @@ def test_sweep_pending_timeouts_does_not_touch_already_resolved_approvals(tmp_pa
     assert fetched.status == PendingApprovalStatus.APPROVED
     events = [e.event_type for e in db.get_audit_log(request_id=pending.request_id)]
     assert AuditEventType.APPROVAL_TIMEOUT not in events
+
+
+# -- T9f: return-to-requester and escalation -- #
+#
+# An insufficient reason goes back to the requester, not to an approver. The
+# request is RETURNED (terminal for the policy) and the requester may either
+# resubmit with a better reason or escalate the same request to a human.
+
+
+RETURNED_DECISION = PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, "reason is missing or a placeholder -- say what you need to do and why")
+
+
+class SequencePolicyEngine(PolicyEngine):
+    """Returns the next decision on each call, so one test can drive a
+    RETURNED request followed by a resubmission that is decided differently."""
+
+    def __init__(self, *decisions: PolicyDecision):
+        self.decisions = list(decisions)
+        self.calls = 0
+
+    def decide(self, requester, resource, access_level, duration_seconds, reason):
+        self.calls += 1
+        return self.decisions.pop(0)
+
+
+def _return_to_requester(broker, reason="idk"):
+    with pytest.raises(ReturnedToRequesterError) as exc_info:
+        broker.request_access(requester="alice", resource="prod-db", access_level="admin", duration_seconds=3600, reason=reason)
+    return exc_info.value
+
+
+def test_return_to_requester_sets_returned_status_and_audits_with_hint(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+
+    err = _return_to_requester(broker)
+
+    assert err.request_id == 1
+    assert err.decision is RETURNED_DECISION
+    assert str(err) == RETURNED_DECISION.reason
+    assert "resubmit" in err.hint and "escalate" in err.hint
+    assert db.get_request(1).status == RequestStatus.RETURNED
+    # nothing was granted and no approver was involved
+    assert connector.issued == []
+    assert db.find_pending_approval("alice", "prod-db", "admin") is None
+
+    events = db.get_audit_log(request_id=1)
+    assert [e.event_type for e in events] == [AuditEventType.REQUESTED, AuditEventType.POLICY_DECIDED, AuditEventType.RETURNED_TO_REQUESTER]
+    assert events[-1].detail == f"{RETURNED_DECISION.reason}; hint: {err.hint}"
+
+
+def test_return_to_requester_keeps_the_triaged_audit_when_triage_ran(tmp_path):
+    decision = PolicyDecision(
+        PolicyDecisionType.RETURN_TO_REQUESTER,
+        "reason does not justify admin access: it describes no change to make",
+        triage_recommendation="DENY",
+        triage_confidence="LOW",
+        triage_risk_flag=True,
+        triage_justification="reason does not justify admin access: it describes no change to make",
+    )
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", decision)
+
+    _return_to_requester(broker, reason="I want to look at the dashboards for a while")
+
+    events = [e.event_type for e in db.get_audit_log(request_id=1)]
+    assert events == [
+        AuditEventType.REQUESTED,
+        AuditEventType.TRIAGED,
+        AuditEventType.POLICY_DECIDED,
+        AuditEventType.RETURNED_TO_REQUESTER,
+    ]
+
+
+def test_resubmitting_after_a_return_is_not_a_duplicate(tmp_path):
+    policy = SequencePolicyEngine(RETURNED_DECISION, PolicyDecision(PolicyDecisionType.AUTO_APPROVE, "fine"))
+    db = Database(str(tmp_path / "broker.db"))
+    broker = Broker(db=db, clock=FakeClock(), policy=policy, connector=MockConnector())
+    _return_to_requester(broker)
+
+    grant = broker.request_access(requester="alice", resource="prod-db", access_level="admin", duration_seconds=3600, reason="rotating leaked credentials after incident 4711")
+
+    assert grant.request_id == 2
+    assert policy.calls == 2  # the resubmission reached the policy: RETURNED is neither ACTIVE nor PENDING
+    assert db.get_request(1).status == RequestStatus.RETURNED
+    assert db.get_request(2).status == RequestStatus.AUTO_APPROVED
+
+
+def test_escalate_returned_request_creates_pending_approval_and_audits(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+    _return_to_requester(broker)
+
+    pending = broker.escalate(1, note="on-call, checking replication lag, ticket OPS-77", requested_by="alice")
+
+    assert pending is not None
+    assert pending.request_id == 1
+    assert pending.status == PendingApprovalStatus.PENDING
+    assert pending.deadline_at == pending.created_at + 14400
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+    assert db.get_request(1).status == RequestStatus.PENDING_HUMAN
+
+    events = db.get_audit_log(request_id=1)
+    assert [e.event_type for e in events] == [
+        AuditEventType.REQUESTED,
+        AuditEventType.POLICY_DECIDED,
+        AuditEventType.RETURNED_TO_REQUESTER,
+        AuditEventType.ESCALATED,
+        AuditEventType.ROUTED_TO_HUMAN,
+    ]
+    assert events[3].detail == "escalated by alice: on-call, checking replication lag, ticket OPS-77"
+    assert events[4].detail == f"escalated by requester; AI returned it because: {RETURNED_DECISION.reason}"
+
+
+def test_escalate_by_someone_other_than_the_requester_returns_none(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+    _return_to_requester(broker)
+
+    assert broker.escalate(1, note="please", requested_by="mallory") is None
+    assert db.get_request(1).status == RequestStatus.RETURNED
+    assert db.find_pending_approval("alice", "prod-db", "admin") is None
+    assert AuditEventType.ESCALATED not in [e.event_type for e in db.get_audit_log(request_id=1)]
+
+
+def test_escalate_twice_returns_none_the_second_time(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+    _return_to_requester(broker)
+    first = broker.escalate(1, note="first", requested_by="alice")
+    assert first is not None
+
+    second = broker.escalate(1, note="second", requested_by="alice")
+
+    assert second is None
+    events = [e.event_type for e in db.get_audit_log(request_id=1)]
+    assert events.count(AuditEventType.ESCALATED) == 1
+    assert events.count(AuditEventType.ROUTED_TO_HUMAN) == 1
+
+
+def test_escalate_unknown_request_returns_none(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+
+    assert broker.escalate(42, note="?", requested_by="alice") is None
+
+
+def test_escalate_a_request_already_pending_human_returns_none(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    pending = _route_to_human_and_get_token(broker)
+
+    assert broker.escalate(pending.request_id, note="hurry", requested_by="alice") is None
+    assert db.get_request(pending.request_id).status == RequestStatus.PENDING_HUMAN
+    assert AuditEventType.ESCALATED not in [e.event_type for e in db.get_audit_log(request_id=pending.request_id)]
+
+
+def test_escalate_an_auto_approved_request_returns_none(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.AUTO_APPROVE, "fine"))
+    grant = broker.request_access(**_request_kwargs())
+
+    assert broker.escalate(grant.request_id, note="?", requested_by="alice") is None
+    assert db.get_request(grant.request_id).status == RequestStatus.AUTO_APPROVED
+
+
+def test_approving_an_escalated_request_issues_a_grant(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+    _return_to_requester(broker)
+    pending = broker.escalate(1, note="on-call, ticket OPS-77", requested_by="alice")
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
+
+    assert resolution.resolved is True
+    assert resolution.grant is not None
+    assert resolution.grant.request_id == 1
+    assert broker.is_active(resolution.grant.id) is True
+    assert len(connector.issued) == 1
+    assert db.get_request(1).status == RequestStatus.HUMAN_APPROVED

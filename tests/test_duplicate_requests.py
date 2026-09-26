@@ -19,6 +19,7 @@ from broker.models import (
     PolicyDecision,
     PolicyDecisionType,
     RequestStatus,
+    ReturnedToRequesterError,
 )
 from broker.policy import PolicyEngine
 
@@ -144,3 +145,21 @@ def test_second_identical_request_while_human_review_pending_points_at_the_pendi
     with pytest.raises(PendingHumanReviewError):
         request(broker, access_level="admin")
     assert policy.calls == 2
+
+
+def test_resubmitting_after_a_return_to_requester_is_not_a_duplicate(tmp_path):
+    """RETURNED is neither an ACTIVE grant nor a PENDING approval, so the
+    requester's second attempt with a better reason reaches the policy."""
+    broker, clock, connector, db, policy = make_broker(
+        tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.RETURN_TO_REQUESTER, "reason is missing or a placeholder")
+    )
+    with pytest.raises(ReturnedToRequesterError):
+        request(broker)
+
+    with pytest.raises(ReturnedToRequesterError):
+        request(broker)
+
+    assert policy.calls == 2
+    assert db.get_request(1).status == RequestStatus.RETURNED
+    assert db.get_request(2).status == RequestStatus.RETURNED
+    assert AuditEventType.DUPLICATE_REJECTED not in [e.event_type for e in db.get_audit_log()]
