@@ -20,7 +20,7 @@ class Broker:
         request_id = self.db.create_request(requester, resource, access_level, duration_seconds, reason, now)
         self.db.append_audit(request_id, None, AuditEventType.REQUESTED, f"{requester} requested {access_level} on {resource} for {duration_seconds}s: {reason}", now)
 
-        decision = self.policy.decide(resource, access_level, duration_seconds, reason)
+        decision = self.policy.decide(requester, resource, access_level, duration_seconds, reason)
         self.db.append_audit(request_id, None, AuditEventType.POLICY_DECIDED, f"{decision.decision.value}: {decision.reason}", now)
 
         if decision.decision != PolicyDecisionType.AUTO_APPROVE:

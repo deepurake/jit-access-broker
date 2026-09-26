@@ -22,6 +22,17 @@ class AuditEventType(str, Enum):
     DENIED = "DENIED"
     EXPIRED = "EXPIRED"
     REVOKED = "REVOKED"
+    ROUTED_TO_HUMAN = "ROUTED_TO_HUMAN"
+    HUMAN_APPROVED = "HUMAN_APPROVED"
+    HUMAN_DENIED = "HUMAN_DENIED"
+    APPROVAL_TIMEOUT = "APPROVAL_TIMEOUT"
+
+
+class PendingApprovalStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    DENIED = "DENIED"
+    TIMED_OUT = "TIMED_OUT"
 
 
 @dataclass
@@ -61,3 +72,15 @@ class AuditEvent:
     event_type: AuditEventType
     detail: str
     at: int
+
+
+@dataclass
+class PendingApproval:
+    id: int
+    request_id: int
+    approval_token: str
+    status: PendingApprovalStatus
+    created_at: int
+    deadline_at: int
+    decided_at: Optional[int]
+    decided_by: Optional[str]
