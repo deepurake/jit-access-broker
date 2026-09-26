@@ -15,6 +15,11 @@
    fail closed, answers "approver is asleep."
 6. Garbage/unparseable LLM output => treated as lowest confidence => routes to human. Never crashes,
    never silently auto-approves.
+7. **Failure policy (user-stated): any system failure falls back to manual review.** A component
+   *denying* is a decision; a component *throwing* is a failure. DecisionRouter catches exceptions
+   from the user directory, the ACL engine, and the triage provider and returns ROUTE_HUMAN with the
+   failure text in the reason (visible to the reviewer and in the audit log). If the ACL boundary
+   itself can't be evaluated, triage is skipped so no ungated AI APPROVE can exist.
 
 ## DAG
 
@@ -23,15 +28,16 @@
 | T1 | Shared contracts: PendingApproval/PendingApprovalStatus + new AuditEventType values (models.py), PolicyEngine.decide(+requester) (policy.py), user_roles/acl_rules/pending_approvals tables + guarded CRUD (db.py) | broker/models.py, broker/policy.py, broker/db.py | none | **done** |
 | T2 | UserDirectory seam: reads user_roles table via Database | broker/user_directory.py, tests/test_user_directory.py | T1 | **done** (46 tests green) |
 | T3 | AclPolicyEngine: loads acl.yaml -> acl_rules table, evaluates role/resource-pattern/max-level/max-duration ceiling | broker/acl_policy.py, broker/acl_loader.py, acl.yaml, tests/test_acl_policy.py | T1 | **done** (14 tests green) |
-| T4 | TriageProvider seam + MockTriageProvider (deterministic heuristic recommend+confidence+justification, real recommend-and-defer behavior) | broker/triage.py, tests/test_triage.py | T1 | pending |
+| T4 | TriageProvider seam + MockTriageProvider (deterministic heuristic recommend+confidence+justification, real recommend-and-defer behavior) | broker/triage.py, tests/test_triage.py | T1 | **done** (5 tests green) |
 | T5 | ClaudeTriageProvider (real Anthropic API, gated by ANTHROPIC_API_KEY, optional/non-blocking) | broker/triage.py (same file as T4, sequential after it) | T4 | **done** (7 tests + 2 gated skips) |
 | T6 | DecisionRouter: composes UserDirectory + AclPolicyEngine + TriageProvider into the PolicyEngine interface per decisions #3/#6 above | broker/decision_router.py, tests/test_decision_router.py | T1, T2, T3, T4 | **done** (8 tests green) |
 | T7 | Broker + CLI: branch on ROUTE_HUMAN -> create_pending_approval + issue approval_url instead of AccessDeniedError; Broker.resolve_approval(); Broker.sweep_pending_timeouts() | broker/broker.py, broker/cli.py, broker/models.py (+Request, PendingHumanReviewError, ApprovalResolution), broker/db.py (+get_request) | T1 | **done** (14 tests green) |
-| T8 | approval_service/: Flask magic-link web app (GET renders, POST decides) calling Broker.resolve_approval | approval_service/app.py, approval_service/Dockerfile, tests/test_approval_service.py | T7 | pending |
+| T8 | approval_service/: Flask magic-link web app (GET renders, POST decides) calling Broker.resolve_approval | approval_service/app.py, approval_service/Dockerfile, docker-compose.yml (+approval-service), tests/test_approval_service.py | T7 | **done** (11 tests green) |
 | T9 | CLI wiring for the human-review path: pending_human output on `request`, new `approve` subcommand, sweep also times out pending approvals | broker/cli.py (same file T7 touches -> sequential after T7, not parallel with it) | T7 | pending |
-| T10a | tests/test_decision_pipeline.py: ACL-deny (no LLM call made), auto-approve, route-human paths | tests/test_decision_pipeline.py | T6, T7, T8, T9 | pending |
-| T10b | tests/test_human_approval.py: approve via URL, deny via URL, timeout sweep, garbage-LLM-output-defers | tests/test_human_approval.py | T6, T7, T8, T9 | pending |
-| T11 | README + REPORT.md: document ACL format, LLM triage design, magic-link flow, answers to "worth thinking about" | README.md, REPORT.md | T10a, T10b | pending |
+| T9b | Hardening from review: (a) resolve_approval rejects self-approval (decided_by == requester) and enforces deadline_at at read time (no fail-open window before the sweep runs); (b) duplicate-request rejection per (requester, resource, access_level) against ACTIVE grants / PENDING approvals, raising DuplicateRequestError that the CLI reports; (c) TRIAGED audit event carrying recommendation/confidence/risk_flag so the log shows *why* the AI recommended what it did | broker/models.py, broker/db.py, broker/broker.py, broker/decision_router.py, broker/cli.py, tests/* | T9 | pending |
+| T10a | tests/test_decision_pipeline.py: ACL-deny (no LLM call made), auto-approve, route-human paths, failure->manual fallback, duplicate rejection | tests/test_decision_pipeline.py | T6, T7, T8, T9, T9b | pending |
+| T10b | tests/test_human_approval.py: approve via URL, deny via URL, timeout sweep, deadline enforced at click time, self-approval rejected, garbage-LLM-output-defers; docker compose validation incl. approval-service | tests/test_human_approval.py, Dockerfile.test, docker-compose.yml | T6, T7, T8, T9, T9b | pending |
+| T11 | README + REPORT.md: rewrite README usage in a plain human voice (how to run, example requests that auto-approve / route to a human / deny); drop the stale 'planned' section (FastAPI, click, background sweeper thread) and state the actual scope cuts honestly; REPORT.md with trade-offs incl. fail-open windows closed/remaining | README.md, REPORT.md | T10a, T10b | pending |
 
 ## Round plan
 - Round 1 (done): T1 (done by coordinator, not a subagent -- foundational/mechanical).

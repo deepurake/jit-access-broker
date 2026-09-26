@@ -12,6 +12,13 @@ Routing rules, in order:
 3. Everything else (including a confident DENY -- AI never gets unilateral
    deny authority -- and any risk_flag=True, even on a confident APPROVE)
    routes to a human.
+
+Failure policy: a component *denying* is a decision; a component *throwing*
+is a system failure. A failure anywhere in this pipeline never crashes the
+request, never auto-denies, and never auto-approves -- it routes to manual
+review with the failure text in the reason, so the reviewer and the audit
+log both see what broke. If the ACL boundary itself can't be evaluated,
+triage is skipped too: an AI APPROVE that nothing has gated must not exist.
 """
 from broker.acl_policy import AclPolicyEngine
 from broker.models import PolicyDecision, PolicyDecisionType
@@ -27,13 +34,19 @@ class DecisionRouter(PolicyEngine):
         self.triage_provider = triage_provider
 
     def decide(self, requester: str, resource: str, access_level: str, duration_seconds: int, reason: str) -> PolicyDecision:
-        role = self.user_directory.get_role(requester)
-        acl_decision = self.acl_engine.evaluate(role, resource, access_level, duration_seconds)
+        try:
+            role = self.user_directory.get_role(requester)
+            acl_decision = self.acl_engine.evaluate(role, resource, access_level, duration_seconds)
+        except Exception as exc:  # deliberate: any failure here -> manual review, see module docstring
+            return self._defer_to_human("access-control evaluation failed", exc)
 
         if not acl_decision.allowed:
             return PolicyDecision(decision=PolicyDecisionType.DENY, reason=acl_decision.reason)
 
-        triage_result = self.triage_provider.triage(resource, access_level, duration_seconds, reason)
+        try:
+            triage_result = self.triage_provider.triage(resource, access_level, duration_seconds, reason)
+        except Exception as exc:  # deliberate: any failure here -> manual review, see module docstring
+            return self._defer_to_human("triage failed", exc)
 
         is_confidently_fine = (
             triage_result.confidence == TriageConfidence.HIGH
@@ -44,3 +57,10 @@ class DecisionRouter(PolicyEngine):
             return PolicyDecision(decision=PolicyDecisionType.AUTO_APPROVE, reason=triage_result.justification)
 
         return PolicyDecision(decision=PolicyDecisionType.ROUTE_HUMAN, reason=triage_result.justification)
+
+    @staticmethod
+    def _defer_to_human(what_failed: str, exc: Exception) -> PolicyDecision:
+        return PolicyDecision(
+            decision=PolicyDecisionType.ROUTE_HUMAN,
+            reason=f"{what_failed} ({type(exc).__name__}: {exc}); deferring to human review",
+        )

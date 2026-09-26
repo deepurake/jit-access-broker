@@ -224,3 +224,78 @@ def test_end_to_end_with_real_mock_triage_provider_substantive_reason_is_auto_ap
 
     assert decision.decision == PolicyDecisionType.AUTO_APPROVE
     assert "proportionate" in decision.reason
+
+
+# --- Failure policy: if the decision machinery itself fails, fall back to a
+# human. A component *denying* is a decision; a component *throwing* is a
+# system failure, and a system failure must never crash the request, never
+# auto-deny, and never auto-approve -- it routes to manual review with the
+# failure recorded in the reason so the reviewer (and the audit log) see it.
+
+
+class ExplodingTriageProvider(TriageProvider):
+    def triage(self, resource, access_level, duration_seconds, reason):
+        raise RuntimeError("triage backend exploded")
+
+
+class ExplodingUserDirectory:
+    def get_role(self, requester):
+        raise ConnectionError("directory unreachable")
+
+
+class ExplodingAclEngine:
+    def evaluate(self, role, resource, access_level, duration_seconds):
+        raise RuntimeError("acl table unreadable")
+
+
+def test_triage_failure_routes_to_human_instead_of_crashing(tmp_path):
+    router, db = make_router(
+        tmp_path,
+        rules=[{"role": "engineer", "resource_pattern": "prod-db", "max_access_level": "read", "max_duration_seconds": 3600}],
+        triage_provider=ExplodingTriageProvider(),
+    )
+    db.set_user_role("ivan", "engineer")
+
+    decision = router.decide(
+        requester="ivan", resource="prod-db", access_level="read", duration_seconds=600, reason="investigating an alert"
+    )
+
+    assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
+    assert "triage" in decision.reason.lower()
+    assert "triage backend exploded" in decision.reason
+
+
+def test_user_directory_failure_routes_to_human_instead_of_denying(tmp_path):
+    db = Database(str(tmp_path / "test.db"))
+    router = DecisionRouter(ExplodingUserDirectory(), AclPolicyEngine(db), MockTriageProvider())
+
+    decision = router.decide(
+        requester="ivan", resource="prod-db", access_level="read", duration_seconds=600, reason="investigating an alert"
+    )
+
+    # Not DENY: an unreachable directory is a failure, not a policy outcome.
+    assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
+    assert "directory unreachable" in decision.reason
+
+
+def test_acl_engine_failure_routes_to_human_and_skips_triage(tmp_path):
+    fake_triage = FakeTriageProvider(
+        TriageResult(
+            recommendation=TriageRecommendation.APPROVE,
+            confidence=TriageConfidence.HIGH,
+            justification="should never be seen",
+        )
+    )
+    db = Database(str(tmp_path / "test.db"))
+    db.set_user_role("ivan", "engineer")
+    router = DecisionRouter(DatabaseUserDirectory(db), ExplodingAclEngine(), fake_triage)
+
+    decision = router.decide(
+        requester="ivan", resource="prod-db", access_level="read", duration_seconds=600, reason="investigating an alert"
+    )
+
+    assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
+    assert "acl table unreadable" in decision.reason
+    # With the ACL boundary unverifiable, the AI step must not run -- it
+    # could otherwise produce a confident APPROVE that nothing has gated.
+    assert fake_triage.calls == []

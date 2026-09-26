@@ -27,3 +27,20 @@ services:
     depends_on:
       - okta-sidecar
       - protected-resource
+
+  approval-service:
+    build:
+      context: .
+      dockerfile: approval_service/Dockerfile
+    environment:
+      BROKER_DB: /data/broker.db
+      SIDECAR_URL: http://okta-sidecar:8081
+    ports:
+      - "8083:8083"
+    volumes:
+      - broker-data:/data
+    depends_on:
+      - okta-sidecar
+
+volumes:
+  broker-data: {}
