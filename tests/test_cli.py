@@ -43,8 +43,43 @@ def parse_field(output, field):
     return match.group(1)
 
 
+ACL_FIXTURE_YAML = """\
+roles:
+  engineer:
+    - resource_pattern: "prod-db"
+      max_access_level: read
+      max_duration_seconds: 3600
+  oncall:
+    - resource_pattern: "prod-*"
+      max_access_level: admin
+      max_duration_seconds: 7200
+  intern:
+    - resource_pattern: "staging-*"
+      max_access_level: read
+      max_duration_seconds: 1800
+"""
+
+
+def write_acl_fixture(tmp_path):
+    acl_path = tmp_path / "acl.yaml"
+    acl_path.write_text(ACL_FIXTURE_YAML)
+    return acl_path
+
+
+def seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="engineer"):
+    """Seeds state the way a real operator would -- through the CLI's own
+    admin subcommands -- so request tests flow through the real
+    ACL -> triage -> router pipeline rather than a permissive stub.
+    Drains capsys so callers only see their own command's output."""
+    acl_path = write_acl_fixture(tmp_path)
+    assert main(["--db", str(db_path), "load-acl", str(acl_path)]) == 0
+    assert main(["--db", str(db_path), "set-role", requester, role]) == 0
+    capsys.readouterr()
+
+
 def test_request_command_prints_active_grant(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
 
     exit_code = main(request_grant(db_path))
 
@@ -58,6 +93,7 @@ def test_request_command_prints_active_grant(tmp_path, capsys):
 
 def test_status_command_reflects_revoke(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path))
     grant_id = parse_field(capsys.readouterr().out, "grant_id")
 
@@ -75,6 +111,7 @@ def test_status_command_reflects_revoke(tmp_path, capsys):
 
 def test_revoke_command_is_idempotent_once_terminal(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path))
     grant_id = parse_field(capsys.readouterr().out, "grant_id")
 
@@ -90,6 +127,7 @@ def test_sweep_command_expires_due_grants(tmp_path, capsys):
     not the fake one the domain tests use, so it's a genuine (if slow)
     wall-clock integration check rather than a unit test."""
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path, duration="1"))
     grant_id = parse_field(capsys.readouterr().out, "grant_id")
 
@@ -106,6 +144,7 @@ def test_sweep_command_expires_due_grants(tmp_path, capsys):
 
 def test_audit_command_lists_full_lifecycle_in_order(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path))
     grant_id = parse_field(capsys.readouterr().out, "grant_id")
 
@@ -124,10 +163,10 @@ def test_audit_command_lists_full_lifecycle_in_order(tmp_path, capsys):
 
 
 def test_request_command_reports_pending_human_review(tmp_path, capsys):
-    """build_broker() hardcodes AlwaysApprovePolicy, which never routes to a
-    human, so this drives cmd_request directly against a hand-built Broker
-    with a policy that does -- the CLI wiring for a real ACL/triage policy is
-    a separate task."""
+    """Drives cmd_request directly against a hand-built Broker with a fixed
+    ROUTE_HUMAN policy, isolating the command's PENDING_HUMAN output format
+    from the real pipeline (which test_request_with_vague_reason_routes_to_human_via_main
+    covers end to end through main())."""
     db_path = tmp_path / "cli.db"
     broker = Broker(
         db=Database(str(db_path)),
@@ -159,6 +198,7 @@ def test_request_command_reports_pending_human_review(tmp_path, capsys):
 
 def test_approve_command_approves_a_pending_request(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path))
     output = capsys.readouterr().out
     request_id = int(parse_field(output, "request_id"))
@@ -176,6 +216,7 @@ def test_approve_command_approves_a_pending_request(tmp_path, capsys):
 
 def test_approve_command_with_unknown_token_fails(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path))
     capsys.readouterr()
 
@@ -188,6 +229,7 @@ def test_approve_command_with_unknown_token_fails(tmp_path, capsys):
 
 def test_sweep_command_reports_expired_and_timed_out_counts(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
     main(request_grant(db_path, duration="1"))
     capsys.readouterr()
 
@@ -197,3 +239,139 @@ def test_sweep_command_reports_expired_and_timed_out_counts(tmp_path, capsys):
     output = capsys.readouterr().out
     assert parse_field(output, "expired_count") == "1"
     assert parse_field(output, "timed_out_count") == "0"
+
+
+# --- T9: real ACL -> triage -> router pipeline wired into the CLI ---------
+
+
+def test_load_acl_command_reports_rule_count(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    acl_path = write_acl_fixture(tmp_path)
+
+    exit_code = main(["--db", str(db_path), "load-acl", str(acl_path)])
+
+    assert exit_code == 0
+    assert parse_field(capsys.readouterr().out, "rules_loaded") == "3"
+
+
+def test_load_acl_command_with_missing_file_fails_cleanly(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    missing = tmp_path / "does-not-exist.yaml"
+
+    exit_code = main(["--db", str(db_path), "load-acl", str(missing)])
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert output.startswith("error:")
+    assert str(missing) in output
+
+
+def test_set_role_command_echoes_assignment(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "set-role", "alice", "engineer"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "requester") == "alice"
+    assert parse_field(output, "role") == "engineer"
+
+
+def test_request_by_requester_with_no_role_is_denied(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    acl_path = write_acl_fixture(tmp_path)
+    main(["--db", str(db_path), "load-acl", str(acl_path)])
+    capsys.readouterr()
+
+    exit_code = main(request_grant(db_path))
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "DENY"
+    assert "no assigned role" in parse_field(output, "detail")
+
+
+def test_request_exceeding_acl_ceiling_is_denied(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="engineer")
+
+    exit_code = main(request_grant(db_path, **{"access-level": "admin"}))
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "DENY"
+    assert "capped" in parse_field(output, "detail")
+
+
+def test_request_with_vague_reason_routes_to_human_via_main(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+
+    exit_code = main(request_grant(db_path, reason="idk"))
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "PENDING_HUMAN"
+    token = parse_field(output, "approval_token")
+    assert parse_field(output, "approval_url") == f"http://localhost:8083/approve/{token}"
+
+
+def test_risk_flag_routes_otherwise_permitted_request_to_human(tmp_path, capsys):
+    """oncall is permitted admin/7200 on prod-* by the ACL and the reason is
+    substantive, so the only thing routing this to a human is the triage
+    risk_flag -- proving risk_flag overrides an otherwise-fine request."""
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+
+    exit_code = main(
+        request_grant(
+            db_path,
+            **{"access-level": "admin"},
+            duration="7200",
+            reason="rotating leaked credentials after incident 4711",
+        )
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "PENDING_HUMAN"
+
+
+def test_full_human_review_loop_via_cli(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+
+    main(
+        request_grant(
+            db_path,
+            **{"access-level": "admin"},
+            duration="7200",
+            reason="rotating leaked credentials after incident 4711",
+        )
+    )
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "PENDING_HUMAN"
+    token = parse_field(output, "approval_token")
+
+    exit_code = main(["--db", str(db_path), "approve", token, "--by", "bob", "--decision", "approve"])
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "resolved") == "true"
+    grant_id = parse_field(output, "grant_id")
+    assert grant_id.isdigit()
+
+    main(["--db", str(db_path), "status", grant_id])
+    output = capsys.readouterr().out
+    assert parse_field(output, "active") == "true"
+    assert parse_field(output, "status") == "ACTIVE"
+
+
+def test_triage_claude_flag_is_accepted_by_parser():
+    """Parser-level only: constructing the real provider is safe, but a
+    request through it would hit the Anthropic API, so we never run one."""
+    args = build_parser().parse_args(["--triage", "claude", "sweep"])
+    assert args.triage == "claude"
+
+    default_args = build_parser().parse_args(["sweep"])
+    assert default_args.triage == "mock"
+    assert default_args.sidecar_url is None
