@@ -21,8 +21,8 @@
 | ID | Task | Files | depends_on | status |
 |----|------|-------|------------|--------|
 | T1 | Shared contracts: PendingApproval/PendingApprovalStatus + new AuditEventType values (models.py), PolicyEngine.decide(+requester) (policy.py), user_roles/acl_rules/pending_approvals tables + guarded CRUD (db.py) | broker/models.py, broker/policy.py, broker/db.py | none | **done** |
-| T2 | UserDirectory seam: reads user_roles table via Database | broker/user_directory.py, tests/test_user_directory.py | T1 | pending |
-| T3 | AclPolicyEngine: loads acl.yaml -> acl_rules table, evaluates role/resource-pattern/max-level/max-duration ceiling | broker/acl_policy.py, broker/acl_loader.py, acl.yaml, tests/test_acl_policy.py | T1 | pending |
+| T2 | UserDirectory seam: reads user_roles table via Database | broker/user_directory.py, tests/test_user_directory.py | T1 | **done** (46 tests green) |
+| T3 | AclPolicyEngine: loads acl.yaml -> acl_rules table, evaluates role/resource-pattern/max-level/max-duration ceiling | broker/acl_policy.py, broker/acl_loader.py, acl.yaml, tests/test_acl_policy.py | T1 | **done** (14 tests green) |
 | T4 | TriageProvider seam + MockTriageProvider (deterministic heuristic recommend+confidence+justification, real recommend-and-defer behavior) | broker/triage.py, tests/test_triage.py | T1 | pending |
 | T5 | ClaudeTriageProvider (real Anthropic API, gated by ANTHROPIC_API_KEY, optional/non-blocking) | broker/triage.py (same file as T4, sequential after it) | T4 | pending |
 | T6 | DecisionRouter: composes UserDirectory + AclPolicyEngine + TriageProvider into the PolicyEngine interface per decisions #3/#6 above | broker/decision_router.py, tests/test_decision_router.py | T1, T2, T3, T4 | pending |

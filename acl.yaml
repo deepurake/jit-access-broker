@@ -1,0 +1,32 @@
+# ACL rules: the git-reviewed, human-authored source of truth for what each
+# role may request. Synced into the acl_rules SQLite table at startup via
+# broker.acl_loader.load_acl_yaml() + Database.load_acl_rules() -- the table
+# is the runtime query path, this file is how humans author and review it
+# (same split as Teleport roles or OPA policy bundles).
+#
+# Each role maps to a list of rules. Each rule:
+#   resource_pattern:      glob pattern (fnmatch-style) matched against the
+#                           requested resource, e.g. "prod-*" matches "prod-db".
+#   max_access_level:      ceiling for the requested access level. One of:
+#                           read < write < admin (a request may ask for this
+#                           level or lower).
+#   max_duration_seconds:  ceiling for the requested grant duration, in seconds.
+#
+# Known limitation: if a role has multiple rules whose resource_pattern both
+# match a requested resource, the first matching rule (in file/table order)
+# wins. Overlapping rules for the same role are not otherwise reconciled.
+roles:
+  engineer:
+    - resource_pattern: "prod-db"
+      max_access_level: read
+      max_duration_seconds: 3600
+
+  oncall:
+    - resource_pattern: "prod-*"
+      max_access_level: admin
+      max_duration_seconds: 7200
+
+  intern:
+    - resource_pattern: "staging-*"
+      max_access_level: read
+      max_duration_seconds: 1800
