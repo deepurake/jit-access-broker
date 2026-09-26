@@ -7,6 +7,7 @@ import sys
 from broker.broker import Broker
 from broker.connector import MockConnector
 from broker.db import Database
+from broker.models import AccessDeniedError
 from broker.policy import AlwaysApprovePolicy
 
 
@@ -14,18 +15,27 @@ def build_broker(db_path: str) -> Broker:
     return Broker(db=Database(db_path), policy=AlwaysApprovePolicy(), connector=MockConnector())
 
 
+def _require_grant(broker: Broker, grant_id: int):
+    """Looks up a grant, printing the standard not-found error if missing.
+    Shared by every subcommand that operates on an existing grant."""
+    grant = broker.db.get_grant(grant_id)
+    if grant is None:
+        print(f"error: no such grant {grant_id}")
+    return grant
+
+
 def cmd_request(args, broker: Broker) -> int:
     try:
         grant = broker.request_access(
             requester=args.requester,
             resource=args.resource,
-            access_level=getattr(args, "access_level"),
+            access_level=args.access_level,
             duration_seconds=args.duration,
             reason=args.reason,
         )
-    except NotImplementedError:
-        print("status: DENIED")
-        print("detail: request was not auto-approved (routing/deny not implemented in stage 1)")
+    except AccessDeniedError as e:
+        print(f"status: {e.decision.decision.value}")
+        print(f"detail: {e.decision.reason}")
         return 1
 
     print(f"status: {grant.status.value}")
@@ -38,9 +48,8 @@ def cmd_request(args, broker: Broker) -> int:
 
 
 def cmd_status(args, broker: Broker) -> int:
-    grant = broker.db.get_grant(args.grant_id)
+    grant = _require_grant(broker, args.grant_id)
     if grant is None:
-        print(f"error: no such grant {args.grant_id}")
         return 1
     print(f"grant_id: {grant.id}")
     print(f"status: {grant.status.value}")
@@ -50,14 +59,12 @@ def cmd_status(args, broker: Broker) -> int:
 
 
 def cmd_revoke(args, broker: Broker) -> int:
-    grant = broker.db.get_grant(args.grant_id)
+    grant = _require_grant(broker, args.grant_id)
     if grant is None:
-        print(f"error: no such grant {args.grant_id}")
         return 1
-    was_active = broker.is_active(grant.id)
-    broker.revoke(args.grant_id, revoked_by=args.by)
+    revoked = broker.revoke(args.grant_id, revoked_by=args.by)
     print(f"grant_id: {grant.id}")
-    print(f"revoked: {'true' if was_active else 'false'}")
+    print(f"revoked: {'true' if revoked else 'false'}")
     return 0
 
 

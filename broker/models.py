@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class GrantStatus(str, Enum):
@@ -29,6 +30,16 @@ class PolicyDecision:
     reason: str
 
 
+class AccessDeniedError(Exception):
+    """Raised by Broker.request_access when the policy engine does not
+    auto-approve. Carries the real PolicyDecision so callers (e.g. the CLI)
+    report the actual reason instead of inventing their own text."""
+
+    def __init__(self, decision: PolicyDecision):
+        super().__init__(decision.reason)
+        self.decision = decision
+
+
 @dataclass
 class Grant:
     id: int
@@ -46,7 +57,7 @@ class Grant:
 class AuditEvent:
     id: int
     request_id: int
-    grant_id: "int | None"
+    grant_id: Optional[int]
     event_type: AuditEventType
     detail: str
     at: int
