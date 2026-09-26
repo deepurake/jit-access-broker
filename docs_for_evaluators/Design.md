@@ -2,22 +2,19 @@
 
 ## How a request is decided
 
-The decision is made in two stages, and the order is the point.
+Two stages, in a fixed order.
 
-**Stage 1 -- may this user or agent hold this access at all?** A deterministic
-check against the ACL in `acl.yaml`: the requester's role, the resource pattern
-it is allowed on, the highest access level and the longest duration that role
-may hold. This is a hard boundary. If it says no, the request is denied right
-there and the AI is never consulted -- so the AI can never talk the broker into
-something the rules forbid.
+**Stage 1 -- ACL: may this user or agent hold this access at all?**
+- Deterministic. Rules live in `acl.yaml`, loaded into the database.
+- Checks the requester's role against: allowed resource pattern, highest access level, longest duration.
+- Fails -> DENY. The AI is never consulted, so it can never override the rules.
 
-**Stage 2 -- is this particular request reasonable?** Only for requests that
-passed stage 1. The LLM is asked to judge the free-text reason: does it justify
-this resource at this level, is the level and duration the minimum that fits,
-how risky is it. The LLM returns a recommendation with a confidence and a risk
-flag; plain code turns that into one of three outcomes -- auto-approve, return
-to the requester, or send to a human -- with two extra deterministic rules from
-the requester's history on top.
+**Stage 2 -- LLM: is this particular request reasonable?**
+- Runs only after stage 1 passes.
+- The model judges the free-text reason: does it justify this resource at this level; is the level and duration the minimum that fits; how risky is it.
+- It returns a recommendation, a confidence, and a risk flag. It never decides.
+- Plain code turns that into one of three outcomes: auto-approve, return to the requester, or human review.
+- Two deterministic history rules sit on top: a recent denial or revocation, or a newcomer asking for large scope, always goes to a human.
 
 The full flow, step by step. The first step that reaches a verdict wins; nothing
 after it runs.
