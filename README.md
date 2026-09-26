@@ -178,8 +178,9 @@ A placeholder reason never reaches the model. `idk` (or anything under ten chara
 $ python -m broker.cli --db broker.db request --requester alice --resource prod-db \
     --access-level read --duration 600 --reason "idk"
 status: RETURNED
+request_id: 9
 detail: reason is missing or a placeholder -- say what you need to do and why
-hint: resubmit with a reason that says what you need to do and why, or escalate to a human reviewer
+hint: fix the reason and resubmit, or escalate this request to a human reviewer
 escalate_with: python -m broker.cli --db broker.db escalate 9 --by alice --note "..."
 ```
 
@@ -189,8 +190,9 @@ A reason that does not fit the permission fails triage step 1. "I want to look a
 $ python -m broker.cli --db broker.db request --requester carol --resource prod-queue \
     --access-level admin --duration 600 --reason "I want to look at the dashboards"
 status: RETURNED
+request_id: 10
 detail: reason does not justify admin access: it describes no change to make
-hint: resubmit with a reason that says what you need to do and why, or escalate to a human reviewer
+hint: fix the reason and resubmit, or escalate this request to a human reviewer
 escalate_with: python -m broker.cli --db broker.db escalate 10 --by carol --note "..."
 ```
 
