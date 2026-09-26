@@ -85,6 +85,17 @@ class PolicyDecision:
     triage_confidence: Optional[str] = None
     triage_risk_flag: Optional[bool] = None
     triage_justification: Optional[str] = None
+    # TriageResult.steps_summary() -- which step passed/failed and why. None
+    # when triage produced no steps (a stepless fake, or never ran).
+    triage_steps_summary: Optional[str] = None
+    # Least-privilege alternative from triage step 2 when the request was
+    # over-scoped. Broker appends it to the ROUTED_TO_HUMAN detail so the
+    # approval page can show the reviewer what would have sufficed.
+    suggested_access_level: Optional[str] = None
+    suggested_duration_seconds: Optional[int] = None
+    # RequesterHistory.summary() when the engine consulted history (only with
+    # a history reader configured, and only past the ACL and junk gate).
+    history_summary: Optional[str] = None
 
 
 class AccessDeniedError(Exception):

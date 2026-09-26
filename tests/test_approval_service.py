@@ -275,6 +275,49 @@ def test_non_escalated_request_page_has_no_escalation_line(env):
     assert b"Escalated by the requester" not in resp.data
 
 
+# -- least-privilege suggestion: when triage found the request over-scoped,
+# the ROUTED_TO_HUMAN detail ends in ` | suggested minimum: level/durations`.
+# The page shows that as its own labelled line, not buried in the
+# justification blockquote, so the reviewer can see the alternative at a glance.
+
+
+def _real_pipeline_client(tmp_path):
+    from broker.acl_policy import AclPolicyEngine
+    from broker.llm_decision_agent import MockTriageProvider
+    from broker.policy_engine import PolicyEngine
+    from broker.user_directory import DatabaseUserDirectory
+
+    db = Database(str(tmp_path / "test.db"))
+    db.load_acl_rules([{"role": "oncall", "resource_pattern": "prod-*", "max_access_level": "admin", "max_duration_seconds": 7200}])
+    db.set_user_role("alice", "oncall")
+    policy = PolicyEngine(DatabaseUserDirectory(db), AclPolicyEngine(db), MockTriageProvider())
+    broker = Broker(db=db, policy=policy, connector=MockConnector(), clock=FakeClock())
+    return broker, create_app(broker).test_client()
+
+
+def test_over_scoped_request_page_shows_the_suggested_minimum_as_its_own_line(tmp_path):
+    broker, client = _real_pipeline_client(tmp_path)
+    token = _route_to_human(broker)  # admin/7200: the mock suggests write/3600
+
+    resp = client.get(f"/approve/{token}")
+
+    assert resp.status_code == 200
+    assert b"Suggested minimum" in resp.data
+    assert b"write for 3600s" in resp.data
+    # the suffix is split off the justification rather than shown twice
+    assert b"| suggested minimum:" not in resp.data
+    assert JUSTIFICATION.encode() in resp.data
+
+
+def test_page_without_a_suggestion_has_no_suggested_minimum_line(env):
+    broker, db, connector, client = env
+    token = _route_to_human(broker)
+
+    resp = client.get(f"/approve/{token}")
+
+    assert b"Suggested minimum" not in resp.data
+
+
 def test_justification_shown_is_the_latest_routed_to_human_event(tmp_path):
     """An escalated request has exactly one ROUTED_TO_HUMAN, but the page is
     explicit about taking the last one so a later routing always wins."""

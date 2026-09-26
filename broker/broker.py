@@ -27,6 +27,11 @@ from broker.policy import Policy
 # the requester was told their options, not just refused).
 RETURN_HINT = "fix the reason and resubmit, or escalate this request to a human reviewer"
 
+# Separates the least-privilege alternative from the justification in a
+# ROUTED_TO_HUMAN audit detail: `<why> | suggested minimum: <level>/<seconds>s`.
+# Shared with the approval page, which parses it back out for display.
+SUGGESTED_MINIMUM_SEPARATOR = " | suggested minimum: "
+
 
 class Broker:
     def __init__(self, db: Database, policy: Policy, connector: ResourceConnector, clock=None, approval_deadline_seconds: int = 14400):
@@ -61,15 +66,19 @@ class Broker:
         decision = self.policy.decide(requester, resource, access_level, duration_seconds, reason)
         if decision.triage_recommendation is not None:
             # Logged before POLICY_DECIDED: the AI's recommendation existed
-            # before the router turned it into a decision.
-            self.db.append_audit(
-                request_id,
-                None,
-                AuditEventType.TRIAGED,
+            # before the router turned it into a decision. The fixed prefix
+            # is followed by optional ` | steps: ...` (which triage step
+            # passed/failed and why) and ` | history: ...` (the requester
+            # record the decision was based on) segments.
+            detail = (
                 f"{decision.triage_recommendation} confidence={decision.triage_confidence} "
-                f"risk_flag={decision.triage_risk_flag}: {decision.triage_justification}",
-                now,
+                f"risk_flag={decision.triage_risk_flag}: {decision.triage_justification}"
             )
+            if decision.triage_steps_summary:
+                detail += f" | steps: {decision.triage_steps_summary}"
+            if decision.history_summary:
+                detail += f" | history: {decision.history_summary}"
+            self.db.append_audit(request_id, None, AuditEventType.TRIAGED, detail, now)
         self.db.append_audit(request_id, None, AuditEventType.POLICY_DECIDED, f"{decision.decision.value}: {decision.reason}", now)
 
         if decision.decision == PolicyDecisionType.DENY:
@@ -88,7 +97,16 @@ class Broker:
             raise ReturnedToRequesterError(request_id, decision, RETURN_HINT)
 
         if decision.decision == PolicyDecisionType.ROUTE_HUMAN:
-            pending = self._route_to_human(request_id, decision.reason, now)
+            why = decision.reason
+            if decision.suggested_access_level is not None or decision.suggested_duration_seconds is not None:
+                # Triage found the request over-scoped and named a smaller
+                # alternative. Half a suggestion is completed from the request
+                # itself (e.g. "shorter, same level"). The approval page
+                # splits this suffix off with SUGGESTED_MINIMUM_SEPARATOR.
+                level = decision.suggested_access_level or access_level
+                duration = decision.suggested_duration_seconds or duration_seconds
+                why += f"{SUGGESTED_MINIMUM_SEPARATOR}{level}/{duration}s"
+            pending = self._route_to_human(request_id, why, now)
             raise PendingHumanReviewError(pending)
 
         self.db.set_request_status(request_id, RequestStatus.AUTO_APPROVED)

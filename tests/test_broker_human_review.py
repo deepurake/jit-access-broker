@@ -516,6 +516,134 @@ def test_escalate_an_auto_approved_request_returns_none(tmp_path):
     assert db.get_request(grant.request_id).status == RequestStatus.AUTO_APPROVED
 
 
+# -- T9d/T9e: triage step details, least-privilege suggestion and requester
+# history in the audit trail. The TRIAGED line keeps its existing prefix
+# (`REC confidence=X risk_flag=Y: justification`) and gains optional
+# ` | steps: ...` and ` | history: ...` segments; ROUTED_TO_HUMAN gains an
+# optional ` | suggested minimum: level/durations` suffix the approval page
+# renders as the least-privilege alternative.
+
+
+def _triaged_detail(db, request_id=1):
+    events = [e for e in db.get_audit_log(request_id=request_id) if e.event_type == AuditEventType.TRIAGED]
+    assert len(events) == 1
+    return events[0].detail
+
+
+def _routed_detail(db, request_id=1):
+    events = [e for e in db.get_audit_log(request_id=request_id) if e.event_type == AuditEventType.ROUTED_TO_HUMAN]
+    assert len(events) == 1
+    return events[0].detail
+
+
+def test_triaged_detail_appends_steps_and_history_segments_when_present(tmp_path):
+    decision = PolicyDecision(
+        PolicyDecisionType.ROUTE_HUMAN,
+        "needs review",
+        triage_recommendation="APPROVE",
+        triage_confidence="MEDIUM",
+        triage_risk_flag=True,
+        triage_justification="reason is present but over-scoped",
+        triage_steps_summary="reason_validation=pass; scope_proportionality=fail (too long)",
+        history_summary="requester=alice total_requests=1 approved_grants=0",
+    )
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", decision)
+    _route_to_human_and_get_token(broker)
+
+    assert _triaged_detail(db) == (
+        "APPROVE confidence=MEDIUM risk_flag=True: reason is present but over-scoped"
+        " | steps: reason_validation=pass; scope_proportionality=fail (too long)"
+        " | history: requester=alice total_requests=1 approved_grants=0"
+    )
+
+
+def test_triaged_detail_omits_segments_that_are_not_set(tmp_path):
+    decision = PolicyDecision(
+        PolicyDecisionType.AUTO_APPROVE,
+        "fine",
+        triage_recommendation="APPROVE",
+        triage_confidence="HIGH",
+        triage_risk_flag=False,
+        triage_justification="fine",
+    )
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", decision)
+    broker.request_access(**_request_kwargs())
+
+    assert _triaged_detail(db) == "APPROVE confidence=HIGH risk_flag=False: fine"
+
+
+def test_routed_to_human_detail_appends_suggested_minimum_when_triage_suggested_one(tmp_path):
+    decision = PolicyDecision(
+        PolicyDecisionType.ROUTE_HUMAN,
+        "needs review",
+        triage_recommendation="APPROVE",
+        triage_confidence="MEDIUM",
+        triage_risk_flag=True,
+        triage_justification="over-scoped",
+        suggested_access_level="write",
+        suggested_duration_seconds=3600,
+    )
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", decision)
+    _route_to_human_and_get_token(broker)
+
+    assert _routed_detail(db) == "needs review | suggested minimum: write/3600s"
+
+
+def test_routed_to_human_detail_fills_the_missing_half_of_a_partial_suggestion_from_the_request(tmp_path):
+    # Only a shorter duration was suggested: the level stays what was asked for.
+    decision = PolicyDecision(
+        PolicyDecisionType.ROUTE_HUMAN,
+        "needs review",
+        triage_recommendation="APPROVE",
+        triage_confidence="MEDIUM",
+        triage_risk_flag=True,
+        triage_justification="too long",
+        suggested_duration_seconds=28800,
+    )
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", decision)
+    _route_to_human_and_get_token(broker)  # asks for admin
+
+    assert _routed_detail(db) == "needs review | suggested minimum: admin/28800s"
+
+
+def test_routed_to_human_detail_has_no_suffix_without_a_suggestion(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    _route_to_human_and_get_token(broker)
+
+    assert _routed_detail(db) == "needs review"
+
+
+def test_real_engine_over_scoped_admin_request_audits_step_details_and_suggested_minimum(tmp_path):
+    """The real pipeline (ACL -> MockTriageProvider -> PolicyEngine) for the
+    oncall admin/7200 case: step 2 fails, so the TRIAGED line shows which
+    step objected and ROUTED_TO_HUMAN carries the least-privilege alternative."""
+    from broker.acl_policy import AclPolicyEngine
+    from broker.llm_decision_agent import MockTriageProvider
+    from broker.policy_engine import PolicyEngine
+    from broker.user_directory import DatabaseUserDirectory
+
+    db = Database(str(tmp_path / "broker.db"))
+    db.load_acl_rules([{"role": "oncall", "resource_pattern": "prod-*", "max_access_level": "admin", "max_duration_seconds": 7200}])
+    db.set_user_role("alice", "oncall")
+    policy = PolicyEngine(DatabaseUserDirectory(db), AclPolicyEngine(db), MockTriageProvider())
+    broker = Broker(db=db, clock=FakeClock(), policy=policy, connector=MockConnector())
+
+    with pytest.raises(PendingHumanReviewError):
+        broker.request_access(
+            requester="alice", resource="prod-db", access_level="admin", duration_seconds=7200,
+            reason="rotating leaked credentials after incident 4711",
+        )
+
+    triaged = _triaged_detail(db)
+    assert triaged.startswith("APPROVE confidence=MEDIUM risk_flag=True: reason is present but admin access for an extended duration carries elevated risk")
+    assert (
+        " | steps: reason_validation=pass; scope_proportionality=fail (admin access for an extended duration carries elevated risk); "
+        "risk_assessment=fail (APPROVE with MEDIUM confidence; over-scoped request flagged for human review)"
+    ) in triaged
+    assert " | history:" not in triaged  # no history reader on this engine
+    assert _routed_detail(db).endswith(" | suggested minimum: write/3600s")
+
+
 def test_approving_an_escalated_request_issues_a_grant(tmp_path):
     broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
     _return_to_requester(broker)

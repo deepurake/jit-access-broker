@@ -9,7 +9,7 @@ import os
 
 from flask import Flask, abort, render_template_string, request
 
-from broker.broker import Broker
+from broker.broker import SUGGESTED_MINIMUM_SEPARATOR, Broker
 from broker.models import AuditEventType, PendingApprovalStatus
 
 NO_JUSTIFICATION = "(no justification recorded)"
@@ -47,6 +47,9 @@ REVIEW_PAGE = """<!doctype html>
   {% endif %}
   <p>The AI triage step did not auto-approve this request. Its justification:</p>
   <blockquote>{{ justification }}</blockquote>
+  {% if suggested_minimum is not none %}
+  <p><strong>Suggested minimum:</strong> {{ suggested_minimum }}</p>
+  {% endif %}
 
   {% if pending.status == PendingApprovalStatus.PENDING %}
   <form method="post" action="/approve/{{ token }}/decide">
@@ -76,6 +79,20 @@ MESSAGE_PAGE = """<!doctype html>
 """
 
 
+def _split_suggested_minimum(detail: str):
+    """A ROUTED_TO_HUMAN detail may end in ` | suggested minimum: write/3600s`
+    (Broker appends it when triage found the request over-scoped). Returns
+    (justification, "write for 3600s") -- or (detail, None) when there is
+    no such suffix -- so the page can label the alternative on its own line
+    instead of burying it in the justification. No schema change: the audit
+    detail is the record, this only parses it back for display."""
+    justification, separator, suggestion = detail.partition(SUGGESTED_MINIMUM_SEPARATOR)
+    if not separator:
+        return detail, None
+    level, slash, duration = suggestion.partition("/")
+    return justification, f"{level} for {duration}" if slash else suggestion
+
+
 def create_app(broker: Broker) -> Flask:
     app = Flask(__name__)
 
@@ -101,6 +118,7 @@ def create_app(broker: Broker) -> Flask:
                 justification = event.detail
             elif event.event_type == AuditEventType.ESCALATED:
                 escalation_note = event.detail.split(": ", 1)[-1]
+        justification, suggested_minimum = _split_suggested_minimum(justification)
 
         return render_template_string(
             REVIEW_PAGE,
@@ -108,6 +126,7 @@ def create_app(broker: Broker) -> Flask:
             pending=pending,
             req=req,
             justification=justification,
+            suggested_minimum=suggested_minimum,
             escalation_note=escalation_note,
             PendingApprovalStatus=PendingApprovalStatus,
         )

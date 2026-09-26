@@ -16,6 +16,7 @@ from broker.policy_engine import PolicyEngine
 from broker.http_connector import HttpResourceConnector
 from broker.models import AccessDeniedError, DuplicateRequestError, PendingApproval, PendingHumanReviewError, ReturnedToRequesterError
 from broker.llm_decision_agent import ClaudeTriageProvider, MockTriageProvider
+from broker.requester_history import RequesterHistoryReader
 from broker.user_directory import DatabaseUserDirectory
 
 
@@ -29,6 +30,10 @@ def build_broker(db_path: str, triage: str = "mock", sidecar_url: Optional[str] 
         user_directory=DatabaseUserDirectory(db),
         acl_engine=AclPolicyEngine(db),
         triage_provider=triage_provider,
+        # The requester's own record in this same SQLite file: newcomers'
+        # large-scope requests and anyone recently denied/revoked go to a
+        # human regardless of the triage verdict (see PolicyEngine docstring).
+        history_reader=RequesterHistoryReader(db),
     )
     connector = HttpResourceConnector(sidecar_url) if sidecar_url else MockConnector()
     return Broker(db=db, policy=policy, connector=connector)

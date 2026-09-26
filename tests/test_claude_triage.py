@@ -334,6 +334,33 @@ def test_second_call_carries_the_request_details_and_effort_low():
     assert '"proportionate"' in client.messages.calls[1]["system"]
 
 
+def test_requester_history_context_reaches_both_model_calls_when_given():
+    client = _FakeClient(_VALID_REASON, _PROPORTIONATE_APPROVE)
+    provider = ClaudeTriageProvider(client=client)
+    history = "requester=alice total_requests=3 approved_grants=2 active=0 revocations=0 denials=1"
+
+    provider.triage("prod-db", "admin", 1800, "rotating leaked credentials after incident 4711", context=history)
+
+    assert len(client.messages.calls) == 2
+    for call in client.messages.calls:
+        user_text = call["messages"][0]["content"]
+        assert user_text.endswith(f"\nRequester history: {history}")
+        # the request fields come first and are untouched
+        assert user_text.startswith("resource: prod-db\naccess_level: admin\n")
+
+
+def test_no_history_line_in_the_prompt_when_context_is_absent():
+    client = _FakeClient(_VALID_REASON, _PROPORTIONATE_APPROVE)
+    provider = ClaudeTriageProvider(client=client)
+
+    provider.triage("prod-db", "admin", 1800, "rotating leaked credentials after incident 4711")
+
+    for call in client.messages.calls:
+        user_text = call["messages"][0]["content"]
+        assert "Requester history" not in user_text
+        assert user_text.endswith("reason: rotating leaked credentials after incident 4711")
+
+
 def test_over_scoped_request_is_flagged_and_carries_least_privilege_suggestion():
     client = _FakeClient(_VALID_REASON, _OVER_SCOPED_APPROVE)
     provider = ClaudeTriageProvider(client=client)

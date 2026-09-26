@@ -603,6 +603,17 @@ def test_show_request_command_with_unknown_id_fails(tmp_path, capsys):
     assert capsys.readouterr().out.strip() == "error: no such request 42"
 
 
+def test_build_broker_wires_requester_history_into_the_policy_engine(tmp_path):
+    """The CLI's engine reads requester history from the same SQLite file it
+    decides against (the end-to-end behaviour is in test_decision_pipeline.py)."""
+    from broker.cli import build_broker
+    from broker.requester_history import RequesterHistoryReader
+
+    broker = build_broker(str(tmp_path / "cli.db"))
+
+    assert isinstance(broker.policy.history_reader, RequesterHistoryReader)
+
+
 def test_triage_claude_flag_is_accepted_by_parser():
     """Parser-level only: constructing the real provider is safe, but a
     request through it would hit the Anthropic API, so we never run one."""

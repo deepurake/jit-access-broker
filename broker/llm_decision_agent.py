@@ -109,7 +109,18 @@ class TriageResult:
 
 class TriageProvider(ABC):
     @abstractmethod
-    def triage(self, resource: str, access_level: str, duration_seconds: int, reason: str) -> TriageResult:
+    def triage(
+        self,
+        resource: str,
+        access_level: str,
+        duration_seconds: int,
+        reason: str,
+        context: Optional[str] = None,
+    ) -> TriageResult:
+        """`context` is optional extra background for the model -- today the
+        requester's history line (RequesterHistory.summary()). Positional
+        arguments are unchanged so existing providers and call sites keep
+        working; a provider that has no use for it may ignore it."""
         ...
 
 
@@ -131,7 +142,16 @@ class MockTriageProvider(TriageProvider):
       3. _assess_risk      -- final recommendation + confidence.
     """
 
-    def triage(self, resource: str, access_level: str, duration_seconds: int, reason: str) -> TriageResult:
+    def triage(
+        self,
+        resource: str,
+        access_level: str,
+        duration_seconds: int,
+        reason: str,
+        context: Optional[str] = None,
+    ) -> TriageResult:
+        # `context` is ignored: the heuristic has no model to hand it to. The
+        # PolicyEngine applies the deterministic history rules itself.
         step1 = self._validate_reason(resource, access_level, duration_seconds, reason)
         if not step1.passed:
             return TriageResult(
@@ -450,13 +470,26 @@ class ClaudeTriageProvider(TriageProvider):
     def __init__(self, client: Optional[anthropic.Anthropic] = None) -> None:
         self._client = client if client is not None else anthropic.Anthropic()
 
-    def triage(self, resource: str, access_level: str, duration_seconds: int, reason: str) -> TriageResult:
+    def triage(
+        self,
+        resource: str,
+        access_level: str,
+        duration_seconds: int,
+        reason: str,
+        context: Optional[str] = None,
+    ) -> TriageResult:
         user_message = (
             f"resource: {resource}\n"
             f"access_level: {access_level}\n"
             f"duration_seconds: {duration_seconds}\n"
             f"reason: {reason}"
         )
+        if context:
+            # The requester's track record, on BOTH calls: it bears on whether
+            # a reason is credible (call 1) and on how much risk an admin
+            # grant carries (call 2). Appended after the request fields so
+            # the model sees it as background, not as part of the reason.
+            user_message += f"\nRequester history: {context}"
 
         # Call 1 / step 1: validate the reason against the requested permission.
         try:
