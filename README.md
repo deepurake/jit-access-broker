@@ -10,13 +10,13 @@ a fake Okta sidecar over HTTP), so the brokering logic is what's under test.
 
 ## Reviewers: start here
 
-Everything written for people is in [`docs_for_evaluators/`](docs_for_evaluators/):
+Everything written for people is in [`docs_for_evaluators/`](docs_for_evaluators/) and [`docs/`](docs/):
 
 1. [`instructions_to_tryout.md`](docs_for_evaluators/instructions_to_tryout.md) -- bring the stack up with Docker Compose and click through a request, an approval, a denial.
 2. [`Design.md`](docs_for_evaluators/Design.md) -- how a request is decided, in plain language, plus the state machines and the key decisions.
-3. [`REPORT.md`](docs_for_evaluators/REPORT.md) -- architecture decisions with motivations, the edge cases from the brief, and the known gaps.
-4. [`cli_walkthrough.md`](docs_for_evaluators/cli_walkthrough.md) -- every path driven from the CLI with real output, including the ones that auto-approve, route to a human, and get denied.
-5. [`brief.md`](docs_for_evaluators/brief.md) -- the original assignment, verbatim.
+3. [`REPORT.md`](docs/REPORT.md) -- architecture decisions with motivations, the edge cases from the brief, and the known gaps.
+4. [`cli_walkthrough.md`](docs/cli_walkthrough.md) -- every path driven from the CLI with real output, including the ones that auto-approve, route to a human, and get denied.
+5. [`brief.md`](docs/brief.md) -- the original assignment, verbatim.
 
 ## Quick check
 

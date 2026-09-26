@@ -1,6 +1,6 @@
 # CLI walkthrough
 
-Everything the broker does, driven from the command line, with real output. For the container-based version see `instructions_to_tryout.md`; for why it behaves this way see `Design.md` and `REPORT.md`.
+Everything the broker does, driven from the command line, with real output. For the container-based version see `docs_for_evaluators/instructions_to_tryout.md`; for why it behaves this way see `docs_for_evaluators/Design.md` and `docs/REPORT.md`.
 
 ## Run it
 
@@ -324,5 +324,6 @@ docker-compose.yml              sidecar, protected resource, approval service, s
 Dockerfile.test                 image for the test-runner service
 tests/                          the executable spec; tests/test_cli.py shows every command and its output
 docs/agent_build_plans_not_for_humans/  task plans written for the AI agents that built this
-docs_for_evaluators/            Design.md, REPORT.md, instructions_to_tryout.md, this walkthrough, the brief
+docs/                           REPORT.md, this walkthrough, the brief
+docs_for_evaluators/            Design.md, instructions_to_tryout.md
 ```
