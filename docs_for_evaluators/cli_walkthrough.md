@@ -16,7 +16,8 @@ Everything below goes through `python -m broker.cli --db broker.db <command>`. E
 
 ```
 $ python -m broker.cli --db broker.db load-acl acl.yaml
-rules_loaded: 3
+rules_loaded: 4
+approver_roles_loaded: 2
 
 $ python -m broker.cli --db broker.db set-role alice engineer
 requester: alice
@@ -25,9 +26,13 @@ role: engineer
 $ python -m broker.cli --db broker.db set-role carol oncall
 requester: carol
 role: oncall
+
+$ python -m broker.cli --db broker.db set-role bob security
+requester: bob
+role: security
 ```
 
-`acl.yaml` ships with three roles: `engineer` may hold up to `read` on `prod-db` for an hour, `oncall` up to `admin` on anything matching `prod-*` for two hours, `intern` up to `read` on `staging-*` for thirty minutes. Bob has no role.
+`acl.yaml` ships with four roles: `engineer` may hold up to `read` on `prod-db` for an hour, `oncall` up to `admin` on anything matching `prod-*` for two hours, `intern` up to `read` on `staging-*` for thirty minutes, and `security` up to `read` anywhere for an hour. It also names the roles that may approve other people's requests: `approver_roles: [security, oncall]`. Bob is `security`, so he can approve; nobody else in these examples can. A name that is not a known user with an approver role is refused (`'rakesh' is not a known approver`) and the link stays pending.
 
 ### Path 1: auto-approve
 
@@ -180,9 +185,9 @@ The audit log is one row per event, append-only. `TRIAGED` sits between `REQUEST
 ```
 $ python -m broker.cli --db broker.db audit --request-id 3
 at=1790405817 event=REQUESTED request=3 grant=- detail=carol requested admin on prod-db for 7200s: rotating leaked credentials after incident 4711
-at=1790405817 event=TRIAGED request=3 grant=- detail=APPROVE confidence=MEDIUM risk_flag=True: reason is present but admin access for an extended duration carries elevated risk
+at=1790405817 event=TRIAGED request=3 grant=- detail=APPROVE confidence=MEDIUM risk_flag=True: reason is present but admin access for an extended duration carries elevated risk | steps: reason_validation=pass; scope_proportionality=fail (admin access for an extended duration carries elevated risk); risk_assessment=fail (APPROVE with MEDIUM confidence; over-scoped request flagged for human review) | history: requester=carol total_requests=1 approved_grants=0 active=0 revocations=0 denials=0 human_approvals=0 pending=0 same_resource=0 same_scope=0 last_denial_at=none last_revocation_at=none
 at=1790405817 event=POLICY_DECIDED request=3 grant=- detail=ROUTE_HUMAN: reason is present but admin access for an extended duration carries elevated risk
-at=1790405817 event=ROUTED_TO_HUMAN request=3 grant=- detail=reason is present but admin access for an extended duration carries elevated risk
+at=1790405817 event=ROUTED_TO_HUMAN request=3 grant=- detail=reason is present but admin access for an extended duration carries elevated risk | suggested minimum: write/3600s
 at=1790405839 event=SELF_APPROVAL_BLOCKED request=3 grant=- detail=self-approval attempt by carol
 at=1790405840 event=HUMAN_APPROVED request=3 grant=2 detail=approved by bob
 ```

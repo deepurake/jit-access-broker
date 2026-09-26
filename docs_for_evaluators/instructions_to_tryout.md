@@ -9,10 +9,11 @@ docker compose cp acl.yaml approval-service:/app/acl.yaml
 b() { docker compose exec -T approval-service python -m broker.cli \
         --db /data/broker.db --sidecar-url http://okta-sidecar:8081 "$@"; }
 
-b load-acl acl.yaml
+b load-acl acl.yaml            # prints rules_loaded: 4, approver_roles_loaded: 2
 b set-role alice engineer
 b set-role carol oncall
 b set-role dave intern
+b set-role bob security        # security is an approver role (acl.yaml: approver_roles)
 ```
 
 ## Minimum test plan
@@ -37,6 +38,7 @@ b request --requester carol --resource prod-db --access-level admin --duration 7
 Expected: `status: PENDING_HUMAN` and an `approval_url`.
 
 Open `approval_url` in a browser:
+- Name `rakesh` (no role) → Approve. Expected: 409, 'rakesh' is not a known approver. Link still pending.
 - Name `carol` → Approve. Expected: 409, requester cannot approve their own request.
 - Name `bob` → Approve. Expected: "Approved -- grant #N issued".
 - Approve again. Expected: 409, already approved.
