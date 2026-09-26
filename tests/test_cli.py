@@ -6,7 +6,20 @@ these tests drive it exactly as a user would, in-process, capturing stdout.
 import re
 import time
 
-from broker.cli import main
+from broker.broker import Broker
+from broker.cli import build_parser, cmd_request, main
+from broker.connector import MockConnector
+from broker.db import Database
+from broker.models import PolicyDecision, PolicyDecisionType
+from broker.policy import PolicyEngine
+
+
+class FixedPolicyEngine(PolicyEngine):
+    def __init__(self, decision: PolicyDecision):
+        self.decision = decision
+
+    def decide(self, requester, resource, access_level, duration_seconds, reason):
+        return self.decision
 
 
 def request_grant(db_path, **overrides):
@@ -108,3 +121,79 @@ def test_audit_command_lists_full_lifecycle_in_order(tmp_path, capsys):
     output = capsys.readouterr().out
     event_types = re.findall(r"event=(\w+)", output)
     assert event_types == ["REQUESTED", "POLICY_DECIDED", "GRANTED", "REVOKED"]
+
+
+def test_request_command_reports_pending_human_review(tmp_path, capsys):
+    """build_broker() hardcodes AlwaysApprovePolicy, which never routes to a
+    human, so this drives cmd_request directly against a hand-built Broker
+    with a policy that does -- the CLI wiring for a real ACL/triage policy is
+    a separate task."""
+    db_path = tmp_path / "cli.db"
+    broker = Broker(
+        db=Database(str(db_path)),
+        policy=FixedPolicyEngine(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")),
+        connector=MockConnector(),
+    )
+    args = build_parser().parse_args(
+        [
+            "--db", str(db_path),
+            "--approval-base-url", "http://localhost:8083",
+            "request",
+            "--requester", "alice",
+            "--resource", "prod-db",
+            "--access-level", "admin",
+            "--duration", "3600",
+            "--reason", "need it",
+        ]
+    )
+
+    exit_code = cmd_request(args, broker)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "PENDING_HUMAN"
+    token = parse_field(output, "approval_token")
+    assert parse_field(output, "approval_url") == f"http://localhost:8083/approve/{token}"
+    assert parse_field(output, "deadline_at")
+
+
+def test_approve_command_approves_a_pending_request(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    main(request_grant(db_path))
+    output = capsys.readouterr().out
+    request_id = int(parse_field(output, "request_id"))
+
+    db = Database(str(db_path))
+    pending = db.create_pending_approval(request_id, "tok-cli-test", created_at=1000, deadline_at=1000 + 14400)
+
+    exit_code = main(["--db", str(db_path), "approve", pending.approval_token, "--by", "bob", "--decision", "approve"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "resolved") == "true"
+    assert parse_field(output, "grant_id").isdigit()
+
+
+def test_approve_command_with_unknown_token_fails(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    main(request_grant(db_path))
+    capsys.readouterr()
+
+    exit_code = main(["--db", str(db_path), "approve", "never-issued", "--by", "bob", "--decision", "approve"])
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "resolved") == "false"
+
+
+def test_sweep_command_reports_expired_and_timed_out_counts(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    main(request_grant(db_path, duration="1"))
+    capsys.readouterr()
+
+    time.sleep(1.2)
+
+    main(["--db", str(db_path), "sweep"])
+    output = capsys.readouterr().out
+    assert parse_field(output, "expired_count") == "1"
+    assert parse_field(output, "timed_out_count") == "0"

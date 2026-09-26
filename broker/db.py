@@ -11,6 +11,7 @@ from broker.models import (
     GrantStatus,
     PendingApproval,
     PendingApprovalStatus,
+    Request,
 )
 
 SCHEMA = """
@@ -94,6 +95,20 @@ class Database:
         )
         self._conn.commit()
         return cur.lastrowid
+
+    def get_request(self, request_id: int) -> Optional[Request]:
+        row = self._conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
+        if row is None:
+            return None
+        return Request(
+            id=row["id"],
+            requester=row["requester"],
+            resource=row["resource"],
+            access_level=row["access_level"],
+            duration_seconds=row["duration_seconds"],
+            reason=row["reason"],
+            created_at=row["created_at"],
+        )
 
     def create_grant(self, request_id, requester, resource, access_level, token, granted_at, expires_at) -> Grant:
         cur = self._conn.execute(

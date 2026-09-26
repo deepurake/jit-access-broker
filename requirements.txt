@@ -2,3 +2,4 @@ pytest>=7.0
 flask>=3.0
 requests>=2.31
 pyyaml>=6.0
+anthropic>=1.8.0
