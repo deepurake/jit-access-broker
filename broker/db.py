@@ -84,7 +84,11 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 
 class Database:
     def __init__(self, path: str):
-        self._conn = sqlite3.connect(path)
+        # check_same_thread=False: the Flask services hand each request to a
+        # worker thread while the Database was opened on the main thread. One
+        # connection, commit after every write, and the services run their
+        # dev server single-threaded, so there is no concurrent use of it.
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
         self._migrate_requests_status_column()
