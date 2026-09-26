@@ -1,140 +1,108 @@
 # Design
 
-## System
+## How a request is decided
 
-```mermaid
-flowchart LR
-    Requester(["Requester"])
-    Approver(["Approver"])
-    Admin(["Admin"])
-    Client(["Client with token"])
+Every request goes through the same steps, in this order. The first step that
+reaches a verdict wins; nothing after it runs.
 
-    subgraph Procs["Broker processes (shared SQLite file)"]
-        CLI["broker CLI"]
-        ApprovalSvc["approval-service :8083"]
-        Sweeper["sweeper (reconcile every 5s)"]
-    end
+```
+request arrives (requester, resource, access level, duration, reason)
+|
+|-- 1. Duplicate?  The same requester already has an ACTIVE grant or a PENDING
+|      review for the same resource and level.
+|        yes -> DUPLICATE. The reply points at the existing grant or review.
+|
+|-- 2. ACL ceiling (deterministic, from acl.yaml).  Does the requester's role
+|      allow this resource, at this level, for this long?
+|        no  -> DENY.  The AI never runs; it cannot override the ACL.
+|
+|-- 3. Junk reason?  A placeholder ("idk", "test", "asdf") or under 10 chars.
+|        yes -> RETURNED to the requester with a hint. No model call, no approver.
+|
+|-- 4. Requester history (read from the same database): prior grants, denials,
+|      revocations, pending reviews. Used in step 6 and shown to the AI.
+|
+|-- 5. AI triage.  It recommends; it never decides.
+|        step 1  Does the reason justify THIS resource at THIS level?
+|                  ("I want to look at the dashboards" does not justify admin)
+|                  no -> RETURNED to the requester with the explanation.
+|        step 2  Is the level and duration the minimum that fits the reason?
+|                  If not, a suggested minimum is recorded for the reviewer.
+|        step 3  Recommendation (APPROVE/DENY), confidence (HIGH/MEDIUM/LOW),
+|                risk flag.
+|
+|-- 6. Routing (plain code, not a model call).
+|        AUTO_APPROVE -> grant issued, only when ALL of these hold:
+|          - HIGH confidence, APPROVE, no risk flag
+|          - no denial or revocation for this requester in the last 30 days
+|          - not a first large-scope request (write/admin, or over 1h) from a
+|            requester with no prior approved grant
+|        HUMAN REVIEW -> everything else: over-scoped, risk-flagged, low or
+|          medium confidence, an AI DENY that did not come from the reason
+|          check, a recent negative event, a newcomer asking for large scope.
+|
+'-- Any step that throws (database, directory, ACL, history, model) -> HUMAN
+    REVIEW, with the error as the reason. Never auto-approve, never auto-deny.
 
-    subgraph Core["Broker core"]
-        Broker["Broker"]
-        subgraph PE["PolicyEngine"]
-            UD["UserDirectory"]
-            ACL["AclPolicyEngine"]
-            Junk{"Junk-reason gate"}
-            Hist["RequesterHistoryReader"]
-            Triage["TriageProvider<br/>Mock or Claude"]
-            Rules{"Routing + history rules"}
-            UD --> ACL --> Junk --> Hist --> Triage --> Rules
-        end
-        Conn["ResourceConnector<br/>Mock or Http"]
-    end
+HUMAN REVIEW
+|   A single-use link. The reviewer must be a known user with an approver
+|   role (acl.yaml: approver_roles) and must not be the requester. Blocked
+|   attempts are audited and leave the link pending for someone else.
+|-- approve -> grant issued (HUMAN_APPROVED)
+|-- deny    -> HUMAN_DENIED, nothing issued
+'-- no decision within 4h -> TIMED_OUT (auto-deny, fail closed). The deadline
+    is checked when the link is used, not only when the sweeper runs.
 
-    DB[("SQLite<br/>requests · grants · pending_approvals<br/>audit_log · user_roles · acl_rules")]
-    YAML["acl.yaml"]
-    Claude["Anthropic API"]
+RETURNED
+|-- resubmit with a better reason (a returned request is not a duplicate)
+'-- escalate -> HUMAN REVIEW. The reviewer sees the AI's objection and the
+    requester's note. Only the requester, only once.
 
-    subgraph EP["Enforcement"]
-        Sidecar["Okta sidecar :8081"]
-        Protected["Protected service :8082"]
-    end
-
-    Requester --> CLI
-    Admin -- "load-acl · set-role" --> CLI
-    Approver --> ApprovalSvc
-    CLI --> Broker
-    ApprovalSvc --> Broker
-    Sweeper --> Broker
-    Broker --> PE
-    Broker --> DB
-    Broker --> Conn
-    PE -.-> DB
-    YAML --> DB
-    Triage --> Claude
-    Conn --> Sidecar
-    Client --> Protected
-    Protected -- "introspect" --> Sidecar
+GRANT
+|-- inactive the instant expires_at passes (checked on read)
+|-- sweeper tears down the external token and marks EXPIRED
+'-- revoke -> REVOKED and the external token is torn down immediately
 ```
 
-## Decision pipeline
+Who does what:
 
-```mermaid
-flowchart TD
-    A(["request_access"]) --> B{"Duplicate?"}
-    B -- yes --> DUP["DUPLICATE"]
-    B -- no --> C{"ACL allows?"}
-    C -- no --> DENY["DENY"]
-    C -- yes --> D{"Junk reason?"}
-    D -- yes --> RET["RETURN_TO_REQUESTER"]
-    D -- no --> E["Load requester history"]
-    E --> F{"Triage step 1:<br/>reason justifies level?"}
-    F -- no --> RET
-    F -- yes --> G{"HIGH + APPROVE + no risk?"}
-    G -- no --> HUM["ROUTE_HUMAN"]
-    G -- yes --> H{"Recent denial/revocation,<br/>or newcomer + large scope?"}
-    H -- yes --> HUM
-    H -- no --> AUTO["AUTO_APPROVE → grant"]
-    RET -- "requester escalates" --> HUM
-    HUM --> I{"Approver decision"}
-    I -- approve --> GR["HUMAN_APPROVED → grant"]
-    I -- deny --> HD["HUMAN_DENIED"]
-    I -- deadline passed --> TO["TIMED_OUT"]
-    C -. "exception" .-> HUM
-    E -. "exception" .-> HUM
-    F -. "exception" .-> HUM
+| Actor | Can |
+|---|---|
+| Deterministic rules (acl.yaml, junk gate, history rules) | deny, return, force human review |
+| AI triage | recommend; auto-approve only the obviously fine case; return an insufficient reason |
+| Approver (known user with an approver role) | approve or deny a pending review, not their own |
+| Requester | request, resubmit, escalate a returned request |
+| Sweeper / clock | expire grants, time out reviews |
+
+## Request and grant states
+
+```
+Request:  PENDING_POLICY -> DUPLICATE | DENIED | RETURNED | AUTO_APPROVED | PENDING_HUMAN
+          RETURNED       -> PENDING_HUMAN            (escalate)
+          PENDING_HUMAN  -> HUMAN_APPROVED | HUMAN_DENIED | TIMED_OUT
+
+Grant:    ACTIVE -> EXPIRED | REVOKED
 ```
 
-## Sequence: human approval
+Every transition is a conditional `UPDATE ... WHERE status = <expected>`; whoever
+commits first wins and the other side is a no-op. That is how a revoke landing at
+the same moment as an expiry, or two reviewers clicking the same link, is settled.
 
-```mermaid
-sequenceDiagram
-    actor R as Requester
-    participant B as Broker
-    participant P as PolicyEngine
-    participant DB as SQLite
-    participant AS as approval-service
-    actor A as Approver
-    participant C as Sidecar
+## Moving parts
 
-    R->>B: request_access
-    B->>DB: INSERT request, audit REQUESTED
-    B->>P: decide
-    P-->>B: ROUTE_HUMAN
-    B->>DB: audit TRIAGED, POLICY_DECIDED
-    B->>DB: INSERT pending_approval, audit ROUTED_TO_HUMAN
-    B-->>R: approval_url
-    A->>AS: GET /approve/token
-    AS-->>A: review page
-    A->>AS: POST /approve/token/decide
-    AS->>B: resolve_approval
-    B->>DB: timeout sweep, self-approval check
-    B->>DB: guarded UPDATE PENDING to APPROVED
-    B->>C: issue
-    C-->>B: token
-    B->>DB: INSERT grant, audit HUMAN_APPROVED
-```
-
-## State machines
-
-```mermaid
-stateDiagram-v2
-    state "Request" as Req {
-        [*] --> PENDING_POLICY
-        PENDING_POLICY --> DUPLICATE
-        PENDING_POLICY --> DENIED
-        PENDING_POLICY --> RETURNED
-        PENDING_POLICY --> AUTO_APPROVED
-        PENDING_POLICY --> PENDING_HUMAN
-        RETURNED --> PENDING_HUMAN : escalate
-        PENDING_HUMAN --> HUMAN_APPROVED
-        PENDING_HUMAN --> HUMAN_DENIED
-        PENDING_HUMAN --> TIMED_OUT
-    }
-    state "Grant" as Gr {
-        [*] --> ACTIVE
-        ACTIVE --> EXPIRED
-        ACTIVE --> REVOKED
-    }
-```
+- **broker CLI** (`python -m broker.cli`): request, approve, escalate, revoke,
+  sweep, audit, load-acl, set-role. Every invocation opens the same SQLite file.
+- **approval-service** (:8083): the review page. GET renders, POST decides.
+- **sweeper**: runs `reconcile` every few seconds -- expires grants (tearing down
+  the external token) and times out stale reviews.
+- **Okta sidecar** (:8081, fake IdP): issues, introspects and revokes tokens.
+- **protected service** (:8082): the resource; checks the bearer token with the
+  sidecar on every request.
+- **SQLite**: requests, grants, pending_approvals, audit_log (append-only),
+  user_roles, acl_rules, approver_roles. `acl.yaml` is the reviewed source of
+  the last two; `load-acl` syncs it in.
+- **Anthropic API** (optional, `--triage claude`): the real model behind the
+  triage seam; the default is a deterministic mock with the same behaviour.
 
 ## Key decisions
 
@@ -148,12 +116,14 @@ stateDiagram-v2
 8. Pending approvals time out after 4h and are auto-denied. The deadline is also checked at click time.
 9. Duplicate requests (same requester, resource and level while one is active or pending) are rejected before policy runs.
 10. Expiry and revocation call `connector.revoke`. The protected service checks the token with the sidecar on every request.
-11. Every external dependency sits behind an interface: Policy, TriageProvider, ResourceConnector, UserDirectory, TokenIntrospector, Clock.
+11. Every external dependency sits behind an interface: Policy, TriageProvider, ResourceConnector, UserDirectory, RequesterHistoryReader, TokenIntrospector, Clock.
+12. Who may approve is data (`approver_roles` in acl.yaml), and the check runs on every decision, CLI or web.
 
 ## Known limitations
 
-- The approver's name is free text: it's authorization of a claimed name, not authentication.
+- The approver's name is typed, not authenticated. It must match a known user with an approver role, but anyone who knows an approver's name can type it. SSO on the review page is the fix.
 - The protected service doesn't check the token's resource.
 - Request status is set before `connector.issue`. If issue fails, the request shows approved with no grant.
 - The duplicate check isn't atomic across processes.
 - `connector.revoke` failure after the status change is not retried.
+- Between sweeps an expired grant's external token stays live (bounded by the sweep interval).
