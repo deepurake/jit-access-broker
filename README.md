@@ -131,6 +131,7 @@ AI triage, and human-approval flow described above:
 Run the evals (they're real tests, not smoke checks — each one fails under a plausible bug mutation):
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pytest tests/test_broker_e2e.py -v
 ```
@@ -145,6 +146,70 @@ pytest tests/test_broker_e2e.py -v
 6. A brand-new `Broker`/`Database` pointed at the same file recovers grant state after a simulated
    process restart.
 
-**Status: Stage 1 done, all 6 evals green.** Not yet built: real policy rules (YAML-driven), human
-approval routing + pending-request timeout, AI triage, duplicate-request rejection, CLI/API layer.
-Those are stage 2+, to be layered on top of these same seams.
+**Status: Stage 1 done.** A CLI (`broker/cli.py`) was added on top: `python3 -m broker.cli --db
+broker.db request|status|revoke|sweep|audit ...`. Not yet built: real policy rules (YAML-driven),
+human approval routing + pending-request timeout, AI triage, duplicate-request rejection. Those
+remain for a later stage, to be layered on top of these same seams.
+
+## Stage 2 — Real HTTP integration (fake Okta sidecar + a protected test service)
+
+Stage 1's `MockConnector` proves the workflow but never leaves the process — `connector.issued`
+and `connector.revoked` are just Python lists. This stage proves the same `ResourceConnector` seam
+works over a real network boundary, and in doing so it surfaced (and fixed) a real bug: **expiry
+was never tearing down the external grant.** `Broker.sweep_expired` updated the broker's own
+database to `EXPIRED` but never called `connector.revoke(...)`, so an expired-per-the-broker grant
+kept working everywhere else. Fixed in `broker/broker.py`; `tests/test_broker_e2e.py`'s
+`test_expired_grant_cannot_be_revoked` was updated to assert the connector *is* called once on
+expiry (and not called again by a subsequent no-op `revoke()`).
+
+**New pieces:**
+- `broker/http_connector.py` — `HttpResourceConnector`, a second `ResourceConnector` implementation
+  that POSTs to a real HTTP service instead of appending to an in-memory list. Same interface,
+  same call sites in `Broker` — this is the shape a real Okta/AWS/Workspace connector would take.
+- `sidecar/app.py` — a fake Okta sidecar (Flask): `POST /grants` issues a token, `GET
+  /introspect/<token>` reports whether it's active, `POST /grants/<token>/revoke` deactivates it.
+  In-memory, per-process state — it's a test double standing in for a real IdP, not a persistence
+  layer.
+- `protected_service/app.py` — the "protected resource" that requires authentication: `GET /data`
+  with `Authorization: Bearer <token>`, authorized by asking a `TokenIntrospector` (same
+  strategy-pattern seam used elsewhere) whether the sidecar still considers the token active.
+
+**Design tradeoff — introspection vs. stateless verification:** this asks the sidecar on every
+request ("is this token still active?") rather than verifying a self-contained signed token
+locally. That's the opposite of how Teleport does it — Teleport issues short-lived signed
+certificates that nodes verify locally with no network round-trip, and handles revocation via short
+TTLs plus a periodically-synced lock/CRL list, trading immediate revocation for scale. Our spec
+requires a revoked or expired grant to be "no longer active," full stop, so synchronous
+introspection is the correct choice here even though it doesn't scale the way Teleport's model
+does. Worth revisiting if request volume ever made per-request introspection a bottleneck.
+
+**Why Docker Compose and not Kubernetes:** a real k8s sidecar needs a running cluster (minikube/kind)
+just to prove a mocked integration — a lot of infrastructure for something the spec explicitly says
+to keep mocked. Compose proves the same "broker talks to a separate process over the network" point
+with one command and no cluster dependency.
+
+**Running it:**
+
+```bash
+docker compose up --build --abort-on-container-exit --exit-code-from test-runner
+docker compose down
+```
+
+This builds three containers (`okta-sidecar`, `protected-resource`, `test-runner`), and the
+`test-runner` runs `tests/test_integration.py` against the other two over the real Docker network,
+exiting non-zero if anything fails. The same test file also runs under plain `pytest` with no
+Docker at all: `tests/conftest.py`'s `sidecar_url`/`protected_service_url` fixtures start real
+instances of both services in background threads when `SIDECAR_URL`/`PROTECTED_SERVICE_URL` aren't
+set in the environment, and point at the live containers when they are — one set of assertions,
+validated both ways.
+
+`tests/test_integration.py` covers:
+1. A broker-issued grant's token gets real `200` access from the protected service.
+2. A token nobody ever issued is rejected (`401`).
+3. Revoking the grant through the broker immediately blocks the protected service.
+4. Letting the grant expire (via `sweep_expired`) immediately blocks the protected service too —
+   this is the regression test for the bug this stage found and fixed.
+
+**Status: Stage 2 done**, 12 new tests (`test_sidecar.py`, `test_http_connector.py`,
+`test_http_introspector.py`, `test_protected_service.py`, `test_integration.py`) plus the 1 updated
+stage-1 test, all green both under plain `pytest` and under `docker compose`.

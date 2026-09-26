@@ -60,5 +60,6 @@ class Broker:
         now = self.clock.now()
         expired_grants = self.db.expire_due_grants(now)
         for grant in expired_grants:
+            self.connector.revoke(grant.resource, grant.access_level, grant.token)
             self.db.append_audit(grant.request_id, grant.id, AuditEventType.EXPIRED, "expired", now)
         return len(expired_grants)

@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY broker/ ./broker/
+COPY sidecar/ ./sidecar/
+COPY protected_service/ ./protected_service/
+COPY tests/ ./tests/
+COPY pytest.ini ./
+CMD ["pytest", "tests/test_integration.py", "-v"]
