@@ -50,6 +50,13 @@ def make_broker(db_path, decision):
     return broker, clock, connector, db, policy
 
 
+def make_approver(db, name, role="security"):
+    """A known user holding an approver role, which is what resolve_approval
+    requires of `decided_by` before it will decide anything."""
+    db.load_approver_roles(["security"])
+    db.set_user_role(name, role)
+
+
 def request(broker, requester="alice", resource="prod-db", access_level="read", duration_seconds=3600):
     return broker.request_access(
         requester=requester,
@@ -141,7 +148,8 @@ def test_second_identical_request_while_human_review_pending_points_at_the_pendi
     assert f"duplicate of pending approval for request {pending.request_id}" in duplicate_events[-1].detail
 
     # once the reviewer denies it, the same access can be asked for again
-    broker.resolve_approval(pending.approval_token, approve=False, decided_by="bob")
+    make_approver(db, "bob")
+    assert broker.resolve_approval(pending.approval_token, approve=False, decided_by="bob").resolved is True
     with pytest.raises(PendingHumanReviewError):
         request(broker, access_level="admin")
     assert policy.calls == 2

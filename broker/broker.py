@@ -165,6 +165,17 @@ class Broker:
         )
 
     def resolve_approval(self, approval_token: str, approve: bool, decided_by: str) -> ApprovalResolution:
+        """Decides a pending human review. Refusals that leave the link
+        PENDING (so a different reviewer can still act) are: the requester
+        deciding their own request, and a `decided_by` who is not a known
+        approver -- a user in user_roles whose role is in approver_roles
+        (see Database.is_approver). Self-approval is checked first, so a
+        requester who also holds an approver role is told "own request".
+
+        `decided_by` is a claimed name: the CLI flag and the web form are
+        the only sources and neither authenticates. This gate is
+        authorization of that claim (policy-as-data for who may approve), not
+        proof of identity; SSO on the approval page is the next step."""
         # Enforce deadlines at click time, not just when a sweeper happens to
         # run: a link whose deadline_at has passed is timed out (and audited)
         # right here, so a stale link can never approve access in the gap
@@ -185,6 +196,15 @@ class Broker:
         if decided_by.strip() == request.requester:
             self.db.append_audit(request.id, None, AuditEventType.SELF_APPROVAL_BLOCKED, f"self-approval attempt by {request.requester}", now)
             return ApprovalResolution(resolved=False, grant=None, reason="requesters cannot approve their own request")
+
+        # Same shape as the self-approval refusal: audited, nothing consumed.
+        # Applies to deny as well -- a stranger may not close a review either.
+        if not self.db.is_approver(decided_by.strip()):
+            self.db.append_audit(
+                request.id, None, AuditEventType.UNAUTHORIZED_APPROVER_BLOCKED,
+                f"approval attempt by '{decided_by}' who is not a known approver", now,
+            )
+            return ApprovalResolution(resolved=False, grant=None, reason=f"'{decided_by}' is not a known approver")
 
         new_status = PendingApprovalStatus.APPROVED if approve else PendingApprovalStatus.DENIED
         transitioned = self.db.resolve_pending_approval(approval_token, new_status, decided_by, now)

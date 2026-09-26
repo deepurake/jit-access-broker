@@ -30,15 +30,22 @@ SUBSTANTIVE_MUTATING_REASON = "rotating leaked credentials after incident 4711"
 LOOK_ONLY_REASON = "I want to look at the dashboards for a while"
 
 
-def seed(db_path, tmp_path, capsys, roles):
-    """Loads the shipped acl.yaml and assigns `roles` ({requester: role})
-    through the CLI's own admin subcommands, then drains capsys."""
+def seed(db_path, tmp_path, capsys, roles, approvers=("bob",)):
+    """Loads the shipped acl.yaml (rules AND approver_roles) and assigns
+    `roles` ({requester: role}) through the CLI's own admin subcommands, then
+    drains capsys. `approvers` are given the `security` role so that
+    `approve --by <name>` accepts them; every scenario that approves as
+    someone names that someone here."""
     acl_copy = tmp_path / "acl.yaml"
     shutil.copy(SHIPPED_ACL, acl_copy)
     assert main(["--db", str(db_path), "load-acl", str(acl_copy)]) == 0
-    assert parse_field(capsys.readouterr().out, "rules_loaded") == "3"
+    out = capsys.readouterr().out
+    assert parse_field(out, "rules_loaded") == "4"
+    assert parse_field(out, "approver_roles_loaded") == "2"
     for requester, role in roles.items():
         assert main(["--db", str(db_path), "set-role", requester, role]) == 0
+    for approver in approvers:
+        assert main(["--db", str(db_path), "set-role", approver, "security"]) == 0
     capsys.readouterr()
 
 
@@ -101,7 +108,7 @@ def test_auto_approve_path(tmp_path, capsys):
 
 def test_deny_path_for_a_requester_with_no_role(tmp_path, capsys):
     db_path = tmp_path / "pipeline.db"
-    seed(db_path, tmp_path, capsys, roles={})  # ACL loaded, nobody assigned
+    seed(db_path, tmp_path, capsys, roles={}, approvers=())  # ACL loaded, nobody assigned
 
     code, out = request(db_path, capsys)
 
@@ -134,7 +141,7 @@ def test_deny_path_for_a_request_over_the_acl_ceiling(tmp_path, capsys):
 
 def test_returned_junk_reason_then_escalate_then_human_approve(tmp_path, capsys):
     db_path = tmp_path / "pipeline.db"
-    seed(db_path, tmp_path, capsys, {"alice": "engineer"})
+    seed(db_path, tmp_path, capsys, {"alice": "engineer"}, approvers=("dana",))
 
     code, out = request(db_path, capsys, reason="idk")
 
@@ -222,7 +229,17 @@ def test_human_review_path_for_an_over_scoped_admin_request(tmp_path, capsys):
     events, _ = audit(db_path, capsys, 2)
     assert events[-1] == "SELF_APPROVAL_BLOCKED"
 
-    # a different reviewer can
+    # so is a name nobody has ever heard of (no role at all)
+    code, out = approve(db_path, capsys, token, by="rakesh")
+    assert code == 1
+    assert parse_field(out, "resolved") == "false"
+    assert parse_field(out, "detail") == "'rakesh' is not a known approver"
+    assert request_status(db_path, capsys, 2) == "PENDING_HUMAN"
+    events, details = audit(db_path, capsys, 2)
+    assert events[-1] == "UNAUTHORIZED_APPROVER_BLOCKED"
+    assert details["UNAUTHORIZED_APPROVER_BLOCKED"] == "approval attempt by 'rakesh' who is not a known approver"
+
+    # a different reviewer who holds an approver role can
     code, out = approve(db_path, capsys, token, by="bob")
     assert code == 0
     assert parse_field(out, "resolved") == "true"
@@ -235,7 +252,10 @@ def test_human_review_path_for_an_over_scoped_admin_request(tmp_path, capsys):
     assert parse_field(out, "active") == "true"
 
     events, details = audit(db_path, capsys, 2)
-    assert events == ["REQUESTED", "TRIAGED", "POLICY_DECIDED", "ROUTED_TO_HUMAN", "SELF_APPROVAL_BLOCKED", "HUMAN_APPROVED"]
+    assert events == [
+        "REQUESTED", "TRIAGED", "POLICY_DECIDED", "ROUTED_TO_HUMAN",
+        "SELF_APPROVAL_BLOCKED", "UNAUTHORIZED_APPROVER_BLOCKED", "HUMAN_APPROVED",
+    ]
     assert details["HUMAN_APPROVED"] == "approved by bob"
 
 

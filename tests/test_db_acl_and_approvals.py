@@ -1,7 +1,7 @@
 """
-Evals for the three schema additions that back the ACL policy engine,
-user-role directory, and human-approval flow: user_roles, acl_rules, and
-pending_approvals. Same guarded-transition pattern as grants (db.py) --
+Evals for the schema additions that back the ACL policy engine, user-role
+directory, and human-approval flow: user_roles, acl_rules, approver_roles
+and pending_approvals. Same guarded-transition pattern as grants (db.py) --
 resolve_pending_approval and sweep_pending_timeouts are both conditional
 UPDATE ... WHERE status='PENDING', for the same race-safety reason.
 """
@@ -63,6 +63,77 @@ def test_load_acl_rules_replaces_previous_rules(tmp_path):
     rules = db.get_acl_rules_for_role("engineer")
     assert len(rules) == 1
     assert rules[0]["resource_pattern"] == "staging-db"
+
+
+# -- approver_roles: is_approver = known user AND their role is an approver role -- #
+
+
+def test_is_approver_true_for_a_known_user_holding_an_approver_role(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security", "oncall"])
+    db.set_user_role("bob", "security")
+    db.set_user_role("carol", "oncall")
+
+    assert db.is_approver("bob") is True
+    assert db.is_approver("carol") is True
+
+
+def test_is_approver_false_for_a_known_user_without_an_approver_role(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security"])
+    db.set_user_role("alice", "engineer")
+
+    assert db.is_approver("alice") is False
+
+
+def test_is_approver_false_for_an_unknown_name(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security"])
+
+    assert db.is_approver("rakesh") is False
+
+
+def test_is_approver_false_for_everyone_when_no_approver_roles_are_loaded(tmp_path):
+    """Fail closed: an empty approver_roles table means nobody can approve,
+    even a user who holds a role that WOULD be an approver role once loaded."""
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+
+    assert db.is_approver("bob") is False
+
+
+def test_load_approver_roles_replaces_the_previous_set(tmp_path):
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+    db.set_user_role("carol", "oncall")
+    db.load_approver_roles(["security", "oncall"])
+    assert db.is_approver("bob") is True and db.is_approver("carol") is True
+
+    db.load_approver_roles(["oncall"])
+
+    assert db.is_approver("bob") is False
+    assert db.is_approver("carol") is True
+
+
+def test_load_approver_roles_with_an_empty_list_clears_the_table(tmp_path):
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+    db.load_approver_roles(["security"])
+
+    db.load_approver_roles([])
+
+    assert db.is_approver("bob") is False
+
+
+def test_load_approver_roles_tolerates_a_repeated_role(tmp_path):
+    """The YAML author listing a role twice is not an error (PRIMARY KEY
+    would otherwise make the replace-all blow up half-way)."""
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+
+    db.load_approver_roles(["security", "security"])
+
+    assert db.is_approver("bob") is True
 
 
 def test_create_and_fetch_pending_approval(tmp_path):

@@ -62,6 +62,13 @@ def _run_in_thread(app):
     return port, server, thread
 
 
+def _seed_approver(db: Database, name: str) -> None:
+    """Makes `name` a known user whose role is an approver role, which is
+    what Broker.resolve_approval requires of whoever clicks approve/deny."""
+    db.load_approver_roles(["security"])
+    db.set_user_role(name, "security")
+
+
 def _wait_until_ready(url: str, timeout: float = 10.0) -> None:
     """Polls until the service answers, or raises. Needed because under
     docker-compose the sibling container may still be starting; under the
@@ -139,11 +146,19 @@ def approval_service_url(tmp_path, sidecar_url):
     one), and share a single FakeClock so time stays under the test's control.
 
     Readiness is probed with a token that can't exist: the 404 is still an
-    HTTP answer, which is all _wait_until_ready needs."""
+    HTTP answer, which is all _wait_until_ready needs.
+
+    Both modes seed one approver, "bob" (role security, listed in
+    approver_roles), because Broker.resolve_approval refuses anyone who is
+    not a known user holding an approver role. Both seeding calls are
+    idempotent (replace-all / upsert), so re-running against the shared
+    env-mode database is fine."""
     env_url = os.environ.get("APPROVAL_SERVICE_URL")
     if env_url:
+        db = Database(os.environ["BROKER_DB"])
+        _seed_approver(db, "bob")
         broker = Broker(
-            db=Database(os.environ["BROKER_DB"]),
+            db=db,
             policy=RouteToHumanPolicy(),
             connector=HttpResourceConnector(sidecar_url),
             clock=SystemClock(),
@@ -164,6 +179,7 @@ def approval_service_url(tmp_path, sidecar_url):
         )
 
     broker = make_broker()
+    _seed_approver(broker.db, "bob")
     port, server, thread = _run_in_thread(_LazyApp(lambda: create_approval_app(make_broker())))
     url = f"http://127.0.0.1:{port}"
     try:

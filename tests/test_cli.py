@@ -5,6 +5,7 @@ these tests drive it exactly as a user would, in-process, capturing stdout.
 """
 import re
 import time
+from pathlib import Path
 
 from broker.broker import Broker
 from broker.cli import build_parser, cmd_request, main
@@ -43,7 +44,10 @@ def parse_field(output, field):
     return match.group(1)
 
 
+SHIPPED_ACL = Path(__file__).resolve().parent.parent / "acl.yaml"
+
 ACL_FIXTURE_YAML = """\
+approver_roles: [security]
 roles:
   engineer:
     - resource_pattern: "prod-db"
@@ -74,6 +78,14 @@ def seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="engine
     acl_path = write_acl_fixture(tmp_path)
     assert main(["--db", str(db_path), "load-acl", str(acl_path)]) == 0
     assert main(["--db", str(db_path), "set-role", requester, role]) == 0
+    capsys.readouterr()
+
+
+def make_approver(db_path, capsys, name):
+    """Makes `name` someone `approve --by <name>` will accept: the fixture
+    ACL lists `security` as an approver role, so one set-role does it. Only
+    tests that expect an approval to go through call this."""
+    assert main(["--db", str(db_path), "set-role", name, "security"]) == 0
     capsys.readouterr()
 
 
@@ -266,6 +278,7 @@ def test_request_command_reports_pending_human_review(tmp_path, capsys):
 def test_approve_command_approves_a_pending_request(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys)
+    make_approver(db_path, capsys, "bob")
     main(request_grant(db_path))
     output = capsys.readouterr().out
     request_id = int(parse_field(output, "request_id"))
@@ -298,6 +311,35 @@ def test_approve_command_with_unknown_token_fails(tmp_path, capsys):
     assert parse_field(output, "detail") == "unknown approval token"
 
 
+def test_approve_command_by_an_unknown_name_is_refused_and_leaves_the_link_pending(tmp_path, capsys):
+    """`--by` is a claimed name, not a login; but the claim must at least be a
+    known user holding an approver role. A stranger changes nothing."""
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    make_approver(db_path, capsys, "bob")
+    main(request_grant(db_path))
+    request_id = int(parse_field(capsys.readouterr().out, "request_id"))
+    now = int(time.time())
+    Database(str(db_path)).create_pending_approval(request_id, "tok-cli-test", created_at=now, deadline_at=now + 14400)
+
+    exit_code = main(["--db", str(db_path), "approve", "tok-cli-test", "--by", "rakesh", "--decision", "approve"])
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "resolved") == "false"
+    assert parse_field(output, "detail") == "'rakesh' is not a known approver"
+    assert "grant_id" not in output
+
+    main(["--db", str(db_path), "audit", "--request-id", str(request_id)])
+    audit_out = capsys.readouterr().out
+    assert re.findall(r"event=(\w+)", audit_out)[-1] == "UNAUTHORIZED_APPROVER_BLOCKED"
+    assert "approval attempt by 'rakesh' who is not a known approver" in audit_out
+
+    # the link is still open for a real approver
+    assert main(["--db", str(db_path), "approve", "tok-cli-test", "--by", "bob", "--decision", "approve"]) == 0
+    assert parse_field(capsys.readouterr().out, "resolved") == "true"
+
+
 def test_sweep_command_reports_expired_and_timed_out_counts(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys)
@@ -322,7 +364,43 @@ def test_load_acl_command_reports_rule_count(tmp_path, capsys):
     exit_code = main(["--db", str(db_path), "load-acl", str(acl_path)])
 
     assert exit_code == 0
-    assert parse_field(capsys.readouterr().out, "rules_loaded") == "3"
+    output = capsys.readouterr().out
+    assert parse_field(output, "rules_loaded") == "3"
+    assert parse_field(output, "approver_roles_loaded") == "1"
+
+
+def test_load_acl_command_loads_the_shipped_acl_yaml_with_its_approver_roles(tmp_path, capsys):
+    """The shipped file is the real policy: security and oncall may approve,
+    and security has its own (read-only) rule so the file is self-consistent."""
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "load-acl", str(SHIPPED_ACL)])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "rules_loaded") == "4"
+    assert parse_field(output, "approver_roles_loaded") == "2"
+    db = Database(str(db_path))
+    db.set_user_role("sec", "security")
+    db.set_user_role("oc", "oncall")
+    db.set_user_role("eng", "engineer")
+    assert db.is_approver("sec") is True
+    assert db.is_approver("oc") is True
+    assert db.is_approver("eng") is False
+
+
+def test_load_acl_without_approver_roles_key_leaves_nobody_able_to_approve(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    acl_path = tmp_path / "acl.yaml"
+    acl_path.write_text(ACL_FIXTURE_YAML.replace("approver_roles: [security]\n", ""))
+
+    exit_code = main(["--db", str(db_path), "load-acl", str(acl_path)])
+
+    assert exit_code == 0
+    assert parse_field(capsys.readouterr().out, "approver_roles_loaded") == "0"
+    db = Database(str(db_path))
+    db.set_user_role("bob", "security")
+    assert db.is_approver("bob") is False
 
 
 def test_load_acl_command_with_missing_file_fails_cleanly(tmp_path, capsys):
@@ -461,6 +539,7 @@ def test_escalate_command_on_unknown_request_fails(tmp_path, capsys):
 def test_full_return_escalate_approve_loop_via_cli(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys)
+    make_approver(db_path, capsys, "bob")
 
     assert main(request_grant(db_path, reason="idk")) == 1
     assert parse_field(capsys.readouterr().out, "status") == "RETURNED"
@@ -511,6 +590,7 @@ def test_risk_flag_routes_otherwise_permitted_request_to_human(tmp_path, capsys)
 def test_full_human_review_loop_via_cli(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+    make_approver(db_path, capsys, "bob")
 
     main(
         request_grant(
@@ -581,6 +661,7 @@ def test_show_request_command_prints_the_request_and_its_status(tmp_path, capsys
 def test_show_request_command_reflects_human_approval(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+    make_approver(db_path, capsys, "bob")
     main(request_grant(db_path, **{"access-level": "admin"}, duration="7200", reason="rotating leaked credentials after incident 4711"))
     token = parse_field(capsys.readouterr().out, "approval_token")
 

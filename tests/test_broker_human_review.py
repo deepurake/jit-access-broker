@@ -43,6 +43,14 @@ def make_broker(db_path, decision, clock=None, connector=None):
     return broker, clock, connector, db
 
 
+def make_approver(db, name, role="security"):
+    """Makes `name` someone resolve_approval will accept: a known user whose
+    role is in approver_roles. Every test that expects an approval to go
+    through seeds its reviewer this way; nothing is an approver by default."""
+    db.load_approver_roles(["security", "oncall"])
+    db.set_user_role(name, role)
+
+
 def test_request_access_routes_to_human_raises_pending_review_error(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
@@ -97,6 +105,7 @@ def test_resolve_approval_approve_issues_active_grant(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)
 
     resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
@@ -114,6 +123,7 @@ def test_resolve_approval_deny_creates_no_grant(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)
 
     resolution = broker.resolve_approval(pending.approval_token, approve=False, decided_by="bob")
@@ -129,6 +139,8 @@ def test_resolving_the_same_token_twice_is_a_noop_the_second_time(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
+    make_approver(db, "carol")
     pending = _route_to_human_and_get_token(broker)
 
     first = broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
@@ -158,6 +170,8 @@ def test_second_resolve_reports_the_approval_is_already_decided(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
+    make_approver(db, "carol")
     pending = _route_to_human_and_get_token(broker)
     broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
 
@@ -196,6 +210,7 @@ def test_requester_cannot_approve_their_own_request_but_someone_else_still_can(t
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)  # requester is "alice"
 
     self_attempt = broker.resolve_approval(pending.approval_token, approve=True, decided_by="alice")
@@ -253,6 +268,7 @@ def test_routed_request_status_is_pending_human(tmp_path):
 
 def test_human_approved_request_status(tmp_path):
     broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)
 
     broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
@@ -262,6 +278,7 @@ def test_human_approved_request_status(tmp_path):
 
 def test_human_denied_request_status(tmp_path):
     broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)
 
     broker.resolve_approval(pending.approval_token, approve=False, decided_by="bob")
@@ -293,6 +310,7 @@ def test_self_approval_attempt_leaves_request_status_pending_human(tmp_path):
 
 def test_reconcile_reports_expired_grants_and_timed_out_approvals(tmp_path):
     broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
     # two distinct pending reviews (different access levels, so not duplicates)
     with pytest.raises(PendingHumanReviewError) as first:
         broker.request_access(requester="alice", resource="prod-db", access_level="read", duration_seconds=60, reason="need it")
@@ -326,6 +344,116 @@ def test_self_approval_check_ignores_surrounding_whitespace(tmp_path):
     assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
 
 
+# -- T9g: only a known user holding an approver role may decide -- #
+#
+# The decider's name is still a claim (no SSO on the approval page yet), but
+# an arbitrary typed name no longer approves anything: it must match a user
+# in user_roles whose role is listed in approver_roles. A refused attempt is
+# audited and leaves the link PENDING for a real approver.
+
+
+def _blocked_events(db, request_id):
+    return [e for e in db.get_audit_log(request_id=request_id) if e.event_type == AuditEventType.UNAUTHORIZED_APPROVER_BLOCKED]
+
+
+def test_unknown_name_cannot_approve_and_a_real_approver_still_can(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
+    pending = _route_to_human_and_get_token(broker)
+
+    stranger = broker.resolve_approval(pending.approval_token, approve=True, decided_by="rakesh")
+
+    assert stranger == ApprovalResolution(resolved=False, grant=None, reason="'rakesh' is not a known approver")
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+    assert db.get_request(pending.request_id).status == RequestStatus.PENDING_HUMAN
+    blocked = _blocked_events(db, pending.request_id)
+    assert len(blocked) == 1
+    assert blocked[0].detail == "approval attempt by 'rakesh' who is not a known approver"
+    assert AuditEventType.HUMAN_APPROVED not in [e.event_type for e in db.get_audit_log(request_id=pending.request_id)]
+
+    by_bob = broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
+
+    assert by_bob.resolved is True
+    assert by_bob.grant is not None
+    assert len(connector.issued) == 1
+    assert db.get_pending_approval_by_token(pending.approval_token).decided_by == "bob"
+
+
+def test_known_user_without_an_approver_role_is_blocked(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
+    db.set_user_role("mallory", "engineer")  # known, but engineer is not an approver role
+    pending = _route_to_human_and_get_token(broker)
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by="mallory")
+
+    assert resolution.resolved is False
+    assert resolution.reason == "'mallory' is not a known approver"
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+    assert len(_blocked_events(db, pending.request_id)) == 1
+
+
+def test_nobody_can_approve_when_no_approver_roles_are_loaded(tmp_path):
+    """Fail closed: a database that never had load-acl run against it (or an
+    acl.yaml without approver_roles) has no approvers at all."""
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    db.set_user_role("bob", "security")  # role assigned, but no approver_roles loaded
+    pending = _route_to_human_and_get_token(broker)
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
+
+    assert resolution.resolved is False
+    assert "not a known approver" in resolution.reason
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+
+
+def test_requester_who_is_also_an_approver_is_still_refused_as_self_approval(tmp_path):
+    """Order matters: self-approval is checked before the approver gate, so
+    the reason (and the audit event) says 'own request', not 'not an approver'."""
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "alice", role="oncall")  # alice is the requester
+    pending = _route_to_human_and_get_token(broker)
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by="alice")
+
+    assert resolution.resolved is False
+    assert "own request" in resolution.reason
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+    events = [e.event_type for e in db.get_audit_log(request_id=pending.request_id)]
+    assert AuditEventType.SELF_APPROVAL_BLOCKED in events
+    assert AuditEventType.UNAUTHORIZED_APPROVER_BLOCKED not in events
+
+
+def test_non_approver_cannot_deny_either(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    pending = _route_to_human_and_get_token(broker)
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=False, decided_by="rakesh")
+
+    assert resolution.resolved is False
+    assert resolution.reason == "'rakesh' is not a known approver"
+    assert db.get_pending_approval_by_token(pending.approval_token).status == PendingApprovalStatus.PENDING
+    assert db.get_request(pending.request_id).status == RequestStatus.PENDING_HUMAN
+    events = [e.event_type for e in db.get_audit_log(request_id=pending.request_id)]
+    assert AuditEventType.HUMAN_DENIED not in events
+    assert events[-1] == AuditEventType.UNAUTHORIZED_APPROVER_BLOCKED
+
+
+def test_approver_check_ignores_surrounding_whitespace(tmp_path):
+    broker, clock, connector, db = make_broker(tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review"))
+    make_approver(db, "bob")
+    pending = _route_to_human_and_get_token(broker)
+
+    resolution = broker.resolve_approval(pending.approval_token, approve=True, decided_by=" bob ")
+
+    assert resolution.resolved is True
+    assert resolution.grant is not None
+
+
 def test_sweep_pending_timeouts_auto_denies_stale_approvals(tmp_path):
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
@@ -347,6 +475,7 @@ def test_sweep_pending_timeouts_does_not_touch_already_resolved_approvals(tmp_pa
     broker, clock, connector, db = make_broker(
         tmp_path / "broker.db", PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, "needs review")
     )
+    make_approver(db, "bob")
     pending = _route_to_human_and_get_token(broker)
     broker.resolve_approval(pending.approval_token, approve=True, decided_by="bob")
 
@@ -646,6 +775,7 @@ def test_real_engine_over_scoped_admin_request_audits_step_details_and_suggested
 
 def test_approving_an_escalated_request_issues_a_grant(tmp_path):
     broker, clock, connector, db = make_broker(tmp_path / "broker.db", RETURNED_DECISION)
+    make_approver(db, "bob")
     _return_to_requester(broker)
     pending = broker.escalate(1, note="on-call, ticket OPS-77", requested_by="alice")
 

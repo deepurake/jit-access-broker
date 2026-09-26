@@ -33,6 +33,10 @@ class AuditEventType(str, Enum):
     # A resolve attempt that was refused without changing the approval's
     # state (e.g. a requester trying to approve their own request).
     SELF_APPROVAL_BLOCKED = "SELF_APPROVAL_BLOCKED"
+    # A resolve attempt (approve or deny) by a name that is not a known user
+    # holding an approver role. Also refused without changing the approval's
+    # state: the link stays PENDING for a real approver.
+    UNAUTHORIZED_APPROVER_BLOCKED = "UNAUTHORIZED_APPROVER_BLOCKED"
     # A request that never reached the policy engine because the same
     # requester already holds an ACTIVE grant / PENDING approval for the
     # same resource + access level.
@@ -186,8 +190,9 @@ class ApprovalResolution:
     'this call actually changed something' from 'no-op, already decided or
     unknown token' -- callers need that distinction even for a deny (which
     has no Grant to return either way). `reason` says WHY when not resolved
-    (unknown token, already decided, timed out, self-approval) so the CLI and
-    web UI can tell the reviewer instead of guessing."""
+    (unknown token, already decided, timed out, self-approval, decider is not
+    a known approver) so the CLI and web UI can tell the reviewer instead of
+    guessing."""
     resolved: bool
     grant: "Optional[Grant]"
     reason: str = ""

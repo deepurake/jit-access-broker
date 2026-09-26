@@ -4,7 +4,10 @@ single-use URL. GET renders what's being asked (including the AI triage
 justification) so the reviewer can decide; the decision itself is a POST so
 a bare link can never approve access on its own. No login -- the unguessable
 single-use token is the credential, and Broker.resolve_approval enforces
-single-use with a guarded DB transition."""
+single-use with a guarded DB transition. The name typed into the form is a
+claim, not an identity: the broker checks it names a known user holding an
+approver role (authorization of the claim), but nothing here proves the
+person typing it is that user. SSO on this page is the next step."""
 import os
 
 from flask import Flask, abort, render_template_string, request
@@ -144,8 +147,9 @@ def create_app(broker: Broker) -> Flask:
         if not resolution.resolved:
             # 409 for every refusal: the client's request conflicts with the
             # approval's current state (decided, timed out, unknown) or with
-            # who is allowed to decide it (the requester). The broker's reason
-            # says which, so the reviewer isn't left guessing.
+            # who is allowed to decide it (the requester themselves, or a name
+            # that is not a known approver). The broker's reason says which,
+            # so the reviewer isn't left guessing.
             return message("Link no longer valid", f"This approval link was not accepted: {resolution.reason}.", 409)
         if resolution.grant is not None:
             return message("Approved", f"Approved -- grant #{resolution.grant.id} issued.", 200)

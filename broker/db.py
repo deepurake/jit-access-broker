@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS acl_rules (
     max_duration_seconds INTEGER NOT NULL
 );
 
+-- Which roles may decide a pending human review. Authored as the
+-- `approver_roles:` list in acl.yaml and synced here by the same load-acl
+-- step as acl_rules. Broker.resolve_approval joins this against user_roles:
+-- a decider must be a known user AND hold one of these roles. An empty
+-- table means nobody can approve (fail closed).
+CREATE TABLE IF NOT EXISTS approver_roles (
+    role TEXT PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS pending_approvals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id INTEGER NOT NULL REFERENCES requests(id),
@@ -279,6 +288,32 @@ class Database:
             (role,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # -- approver_roles: authored in acl.yaml, served from this table -- #
+
+    def load_approver_roles(self, roles: List[str]) -> None:
+        """Replaces the whole set of approver roles -- the runtime sync step
+        for acl.yaml's `approver_roles:` list, same replace-all semantics as
+        load_acl_rules. Loading [] leaves nobody able to approve."""
+        self._conn.execute("DELETE FROM approver_roles")
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO approver_roles (role) VALUES (?)",
+            [(role,) for role in roles],
+        )
+        self._conn.commit()
+
+    def is_approver(self, name: str) -> bool:
+        """True iff `name` is a known user (present in user_roles) whose role
+        is one of the approver roles. This authorizes a CLAIMED name -- it is
+        not authentication; nothing here proves the caller is that user. It
+        does make "who may approve" policy-as-data instead of "anyone who
+        types a name". Unknown names, known users in non-approver roles and
+        an empty approver_roles table all answer False."""
+        row = self._conn.execute(
+            "SELECT 1 FROM user_roles u JOIN approver_roles a ON a.role = u.role WHERE u.requester = ? LIMIT 1",
+            (name,),
+        ).fetchone()
+        return row is not None
 
     # -- pending_approvals: the human-review magic-link flow -- #
 

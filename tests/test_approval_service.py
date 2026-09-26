@@ -37,9 +37,17 @@ class FixedPolicy(Policy):
         return self.decision
 
 
+def make_approver(db, name, role="security"):
+    """A known user holding an approver role -- the only kind of name
+    Broker.resolve_approval accepts. The reviewer in these tests is "bob"."""
+    db.load_approver_roles(["security", "oncall"])
+    db.set_user_role(name, role)
+
+
 @pytest.fixture
 def env(tmp_path):
     db = Database(str(tmp_path / "test.db"))
+    make_approver(db, "bob")
     clock = FakeClock()
     connector = MockConnector()
     policy = FixedPolicy(PolicyDecision(PolicyDecisionType.ROUTE_HUMAN, JUSTIFICATION))
@@ -180,6 +188,39 @@ def test_post_by_the_requester_is_409_and_leaves_pending(env):
     assert resp.status_code == 409
     assert b"own request" in resp.data
     assert connector.issued == []
+    assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.PENDING
+
+
+def test_post_by_an_unknown_name_is_409_and_leaves_pending(env):
+    """Typing a name into the form is a claim, not a login -- but the claim
+    must at least name a known user with an approver role. "rakesh" is
+    neither, so nothing is decided and the link stays open for bob."""
+    broker, db, connector, client = env
+    token = _route_to_human(broker)
+
+    resp = client.post(f"/approve/{token}/decide", data={"decision": "approve", "decided_by": "rakesh"})
+
+    assert resp.status_code == 409
+    assert b"not a known approver" in resp.data
+    assert b"rakesh" in resp.data
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.PENDING
+    events = [e.event_type for e in db.get_audit_log(request_id=db.get_pending_approval_by_token(token).request_id)]
+    assert events[-1] == AuditEventType.UNAUTHORIZED_APPROVER_BLOCKED
+
+    follow_up = client.post(f"/approve/{token}/decide", data={"decision": "approve", "decided_by": "bob"})
+    assert follow_up.status_code == 200
+    assert db.get_pending_approval_by_token(token).decided_by == "bob"
+
+
+def test_post_deny_by_an_unknown_name_is_409_and_leaves_pending(env):
+    broker, db, connector, client = env
+    token = _route_to_human(broker)
+
+    resp = client.post(f"/approve/{token}/decide", data={"decision": "deny", "decided_by": "rakesh"})
+
+    assert resp.status_code == 409
+    assert b"not a known approver" in resp.data
     assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.PENDING
 
 

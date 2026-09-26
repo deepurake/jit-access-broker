@@ -7,7 +7,7 @@ import sys
 import time
 from typing import Optional
 
-from broker.acl_loader import load_acl_yaml
+from broker.acl_loader import load_acl_yaml, load_approver_roles
 from broker.acl_policy import AclPolicyEngine
 from broker.broker import Broker
 from broker.connector import MockConnector
@@ -193,15 +193,19 @@ def cmd_audit(args, broker: Broker) -> int:
 
 
 def cmd_load_acl(args, broker: Broker) -> int:
-    """Syncs the human-authored acl.yaml into the acl_rules table. Admin
-    operation, not a requester action, so it deliberately writes no audit
-    events -- the audit log records access decisions, not config syncs."""
+    """Syncs the human-authored acl.yaml into the acl_rules and
+    approver_roles tables. Admin operation, not a requester action, so it
+    deliberately writes no audit events -- the audit log records access
+    decisions, not config syncs."""
     if not os.path.exists(args.path):
         print(f"error: no such file {args.path}")
         return 1
     rules = load_acl_yaml(args.path)
+    approver_roles = load_approver_roles(args.path)
     broker.db.load_acl_rules(rules)
+    broker.db.load_approver_roles(approver_roles)
     print(f"rules_loaded: {len(rules)}")
+    print(f"approver_roles_loaded: {len(approver_roles)}")
     return 0
 
 
@@ -265,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_approve = sub.add_parser("approve", help="resolve a pending human-review approval")
     p_approve.add_argument("token")
-    p_approve.add_argument("--by", required=True, help="who is deciding")
+    p_approve.add_argument("--by", required=True, help="who is deciding (must be a known user holding an approver role)")
     p_approve.add_argument("--decision", choices=["approve", "deny"], required=True)
     p_approve.set_defaults(func=cmd_approve)
 
@@ -275,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_escalate.add_argument("--note", required=True, help="what the reviewer should know that the original reason didn't say")
     p_escalate.set_defaults(func=cmd_escalate)
 
-    p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules table")
+    p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules and approver roles tables")
     p_load_acl.add_argument("path", help="path to the acl.yaml file")
     p_load_acl.set_defaults(func=cmd_load_acl)
 
