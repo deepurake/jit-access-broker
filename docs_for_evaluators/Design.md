@@ -12,8 +12,11 @@ Two stages, in a fixed order.
 **Stage 2 -- LLM: is this particular request reasonable?**
 - Runs only after stage 1 passes.
 - The model judges the free-text reason: does it justify this resource at this level; is the level and duration the minimum that fits; how risky is it.
-- It returns a recommendation, a confidence, and a risk flag. It never decides.
-- Plain code turns that into one of three outcomes: auto-approve, return to the requester, or human review.
+- The LLM only advises: it returns a recommendation (approve or deny), a confidence (high, medium or low), and a risk flag.
+- The policy engine, which is plain code, turns that advice into the outcome:
+  - **Auto-approve:** high confidence, recommends approve, and no risk flag.
+  - **Return to the requester:** the reason is too short or a placeholder (caught before the LLM is called), or the LLM finds it doesn't justify the requested level. The requester can fix the reason and resubmit, or escalate to a human.
+  - **Human review:** everything else.
 - Two deterministic history rules sit on top: a recent denial or revocation, or a newcomer asking for large scope, always goes to a human.
 
 The full flow, step by step. The first step that reaches a verdict wins; nothing
@@ -102,42 +105,39 @@ Every transition is a conditional `UPDATE ... WHERE status = <expected>`; whoeve
 commits first wins and the other side is a no-op. That is how a revoke landing at
 the same moment as an expiry, or two reviewers clicking the same link, is settled.
 
-## Moving parts
-
-- **broker CLI** (`python -m broker.cli`): request, approve, escalate, revoke,
-  sweep, audit, load-acl, set-role. Every invocation opens the same SQLite file.
-- **approval-service** (:8083): the review page. GET renders, POST decides.
-- **sweeper**: runs `reconcile` every few seconds -- expires grants (tearing down
-  the external token) and times out stale reviews.
-- **Okta sidecar** (:8081, fake IdP): issues, introspects and revokes tokens.
-- **protected service** (:8082): the resource; checks the bearer token with the
-  sidecar on every request.
-- **SQLite**: requests, grants, pending_approvals, audit_log (append-only),
-  user_roles, acl_rules, approver_roles. `acl.yaml` is the reviewed source of
-  the last two; `load-acl` syncs it in.
-- **Anthropic API** (optional, `--triage claude`): the real model behind the
-  triage seam; the default is a deterministic mock with the same behaviour.
-
 ## Key decisions
 
-1. The ACL is a hard stop and runs before the AI. The AI never overrides it.
-2. The AI may auto-approve only with HIGH confidence, APPROVE, and no risk flag. It never denies on its own.
-3. A weak reason goes back to the requester, who can resubmit or escalate. It doesn't go to an approver.
-4. Requester history only tightens a decision: a recent denial or revocation, or a newcomer asking for large scope, goes to a human.
-5. Any exception in the pipeline routes to a human, never to an automatic approve or deny.
-6. Routing is plain code, not a model call.
-7. SQLite is the single source of truth. Guarded `UPDATE ... WHERE status=...` settles races.
-8. Pending approvals time out after 4h and are auto-denied. The deadline is also checked at click time.
-9. Duplicate requests (same requester, resource and level while one is active or pending) are rejected before policy runs.
-10. Expiry and revocation call `connector.revoke`. The protected service checks the token with the sidecar on every request.
-11. Every external dependency sits behind an interface: Policy, TriageProvider, ResourceConnector, UserDirectory, RequesterHistoryReader, TokenIntrospector, Clock.
-12. Who may approve is data (`approver_roles` in acl.yaml), and the check runs on every decision, CLI or web.
+1. **Deterministic ACL before AI.** Every request passes the ACL before triage runs, and an ACL denial is final.
 
-## Known limitations
+	*Why:* access boundaries stay auditable and predictable, a model can never grant past them, and denied requests cost no LLM call.
 
-- The approver's name is typed, not authenticated. It must match a known user with an approver role, but anyone who knows an approver's name can type it. SSO on the review page is the fix.
-- The protected service doesn't check the token's resource.
-- Request status is set before `connector.issue`. If issue fails, the request shows approved with no grant.
-- The duplicate check isn't atomic across processes.
-- `connector.revoke` failure after the status change is not retried.
-- Between sweeps an expired grant's external token stays live (bounded by the sweep interval).
+2. **When in doubt, a human decides.** The AI auto-approves only with HIGH confidence, APPROVE, and no risk flag. Everything else goes to a human: low or medium confidence, a risk flag, an AI recommendation to deny, and any exception anywhere in the pipeline (logged with the error in the reason). The human gets a single-use approval link, valid for 4 hours: opening it shows the request, the reason and the AI's justification, and an approve or deny only takes effect when it comes from someone with an approver role who is not the requester.
+
+	*Why:* a request is auto-approved only after it has passed the ACL checks and the agent is highly confident. The agent is never allowed to deny on its own, because an auto-deny would block legitimate work. A broken component must fail safe: never auto-approve, never silently block.
+
+3. **Weak reasons go back to the requester.** A junk reason, or one that doesn't justify the requested level, is returned with the option to resubmit or escalate.
+
+	*Why:* only the requester can fix the wording, so approvers aren't turned into an approval desk.
+
+4. **Past behavior builds auto-approval confidence.** The requesting user's or agent's history decides how far auto-approval can be trusted. Today it can only hold a request back: a recent denial or revocation, or a newcomer asking for large scope, forces human review.
+
+	*Why:* trust is earned from the requester's own record, not from how convincing a reason string sounds. New and untested agents carry more risk, while an agent that has been used repeatedly without problems earns more confidence for auto-approval. Today this is a simple heuristic (recent denials or revocations, and first large-scope requests). In future, the broker should analyse each agent's past traces to build a risk profile, and use that profile to strengthen its auto-approval decisions.
+
+5. **Routing is plain code.** Thresholds and rules live in `PolicyEngine`, not in a prompt.
+
+	*Why:* policy has to be readable, testable, and give the same answer every time.
+
+6. **Audit trails (stored in SQL) as the single source of truth.** All requests, grants, approvals and an append-only audit log live in one database, and nothing important is kept in memory.
+
+	*Why:* restarts lose nothing, every decision can be traced after the fact, and when actions race (e.g. expiry and revocation) only one can win.
+
+7. **Additional protections: approval timeout, request deduplication and idempotency.**
+   - **Approval timeout:** a pending approval is auto-denied after 4h, and the deadline is also checked when the link is clicked.
+   - **Request deduplication:** a request matching an active grant or pending approval (same requester, resource and level) is recorded and rejected before policy runs.
+   - **Idempotency:** repeating an action changes nothing. A second approval click, a revoke of an already-ended grant, or a repeated sweep never issues or tears down access twice.
+
+	*Why:* a sleeping approver can't leave requests open forever, a stale link can't grant access, and retries or repeated clicks can't produce double grants, extra LLM calls, or a second chance at a different answer.
+
+8. **Opaque bearer tokens, checked on every request (not JWTs).** An approved grant gives the requester a random, meaningless token issued by the identity provider (the fake Okta sidecar). The client sends it as `Authorization: Bearer <token>`, and the protected service asks the identity provider whether it is still active (`GET /introspect/<token>`) on every request.
+
+	*Why:* the brief requires an expired or revoked grant to stop working, full stop. A JWT is checked locally and stays valid until its `exp`, so revoking it early doesn't take effect. With introspection, revocation and expiry take effect on the very next request. The cost is a network call per request and a dependency on the identity provider being up. At higher volume, the next step would be short-lived JWTs whose `exp` is no later than the grant's expiry, accepting a small revocation delay in exchange for local checks.
