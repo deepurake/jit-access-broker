@@ -24,9 +24,14 @@ services:
     environment:
       SIDECAR_URL: http://okta-sidecar:8081
       PROTECTED_SERVICE_URL: http://protected-resource:8082
+      APPROVAL_SERVICE_URL: http://approval-service:8083
+      BROKER_DB: /data/broker.db
+    volumes:
+      - broker-data:/data
     depends_on:
       - okta-sidecar
       - protected-resource
+      - approval-service
 
   approval-service:
     build:
@@ -37,6 +42,20 @@ services:
       SIDECAR_URL: http://okta-sidecar:8081
     ports:
       - "8083:8083"
+    volumes:
+      - broker-data:/data
+    depends_on:
+      - okta-sidecar
+
+  # Periodic reconciliation against the same SQLite file and sidecar the
+  # approval service uses: tears down expired grants on the sidecar and
+  # auto-denies pending approvals past their deadline. Without it those only
+  # happen when someone runs `sweep` by hand or clicks a stale link.
+  sweeper:
+    build:
+      context: .
+      dockerfile: approval_service/Dockerfile
+    command: ["python", "-m", "broker.cli", "--db", "/data/broker.db", "--sidecar-url", "http://okta-sidecar:8081", "sweep", "--loop", "--interval", "5"]
     volumes:
       - broker-data:/data
     depends_on:

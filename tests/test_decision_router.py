@@ -64,6 +64,11 @@ def test_acl_deny_short_circuits_before_triage_is_ever_called(tmp_path):
     assert decision.decision == PolicyDecisionType.DENY
     assert "no assigned role" in decision.reason
     assert fake_triage.calls == []
+    # triage never ran, so there is no triage signal to report
+    assert decision.triage_recommendation is None
+    assert decision.triage_confidence is None
+    assert decision.triage_risk_flag is None
+    assert decision.triage_justification is None
 
 
 def test_acl_denies_on_ceiling_violation_before_triage_is_ever_called(tmp_path):
@@ -114,6 +119,12 @@ def test_acl_allow_plus_high_confidence_approve_no_risk_is_auto_approved(tmp_pat
     assert decision.decision == PolicyDecisionType.AUTO_APPROVE
     assert decision.reason == "reason is clearly legitimate"
     assert fake_triage.calls == [("prod-db", "read", 600, "debugging an incident")]
+    # the triage signal survives into the decision so the broker can audit
+    # WHY the AI recommended what it did, not just the flattened reason
+    assert decision.triage_recommendation == "APPROVE"
+    assert decision.triage_confidence == "HIGH"
+    assert decision.triage_risk_flag is False
+    assert decision.triage_justification == "reason is clearly legitimate"
 
 
 def test_confident_deny_still_routes_to_human_not_denied_outright(tmp_path):
@@ -164,6 +175,10 @@ def test_risk_flag_forces_human_review_even_on_confident_approve(tmp_path):
 
     assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
     assert decision.reason == "approved but flagged as risky"
+    assert decision.triage_recommendation == "APPROVE"
+    assert decision.triage_confidence == "HIGH"
+    assert decision.triage_risk_flag is True
+    assert decision.triage_justification == "approved but flagged as risky"
 
 
 def test_medium_confidence_approve_is_not_high_enough_to_auto_approve(tmp_path):
@@ -263,6 +278,9 @@ def test_triage_failure_routes_to_human_instead_of_crashing(tmp_path):
     assert decision.decision == PolicyDecisionType.ROUTE_HUMAN
     assert "triage" in decision.reason.lower()
     assert "triage backend exploded" in decision.reason
+    # a failed triage call produced no recommendation to record
+    assert decision.triage_recommendation is None
+    assert decision.triage_confidence is None
 
 
 def test_user_directory_failure_routes_to_human_instead_of_denying(tmp_path):

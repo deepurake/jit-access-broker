@@ -137,6 +137,43 @@ def test_sweep_pending_timeouts_ignores_approvals_not_yet_due(tmp_path):
     assert db.get_pending_approval_by_token("tok-abc123").status == PendingApprovalStatus.PENDING
 
 
+def test_find_pending_approval_matches_on_the_requests_tuple(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "admin", 3600, "reason", at=1000)
+    db.create_pending_approval(request_id, "tok-abc123", created_at=1000, deadline_at=5000)
+
+    found = db.find_pending_approval("alice", "prod-db", "admin")
+
+    assert found is not None
+    assert found.approval_token == "tok-abc123"
+    # different access level, different requester -> not the same access
+    assert db.find_pending_approval("alice", "prod-db", "read") is None
+    assert db.find_pending_approval("bob", "prod-db", "admin") is None
+
+
+def test_find_pending_approval_ignores_decided_approvals(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "admin", 3600, "reason", at=1000)
+    db.create_pending_approval(request_id, "tok-abc123", created_at=1000, deadline_at=5000)
+    db.resolve_pending_approval("tok-abc123", PendingApprovalStatus.DENIED, decided_by="bob", now=2000)
+
+    assert db.find_pending_approval("alice", "prod-db", "admin") is None
+
+
+def test_find_active_grant_respects_status_and_expiry(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "read", 600, "reason", at=1000)
+    grant = db.create_grant(request_id, "alice", "prod-db", "read", "tok", granted_at=1000, expires_at=1600)
+
+    assert db.find_active_grant("alice", "prod-db", "read", now=1500).id == grant.id
+    # expired by the clock even though no sweep has flipped the row yet
+    assert db.find_active_grant("alice", "prod-db", "read", now=1600) is None
+    assert db.find_active_grant("alice", "prod-db", "write", now=1500) is None
+
+    db.revoke_grant(grant.id)
+    assert db.find_active_grant("alice", "prod-db", "read", now=1500) is None
+
+
 def test_sweep_does_not_time_out_an_already_decided_approval(tmp_path):
     db = make_db(tmp_path)
     request_id = db.create_request("alice", "prod-db", "admin", 3600, "reason", at=1000)

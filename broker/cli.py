@@ -4,6 +4,7 @@ the way a real CLI is used -- this is not an in-memory demo harness."""
 import argparse
 import os
 import sys
+import time
 from typing import Optional
 
 from broker.acl_loader import load_acl_yaml
@@ -13,7 +14,7 @@ from broker.connector import MockConnector
 from broker.db import Database
 from broker.decision_router import DecisionRouter
 from broker.http_connector import HttpResourceConnector
-from broker.models import AccessDeniedError, PendingHumanReviewError
+from broker.models import AccessDeniedError, DuplicateRequestError, PendingHumanReviewError
 from broker.triage import ClaudeTriageProvider, MockTriageProvider
 from broker.user_directory import DatabaseUserDirectory
 
@@ -55,6 +56,14 @@ def cmd_request(args, broker: Broker) -> int:
         print(f"status: {e.decision.decision.value}")
         print(f"detail: {e.decision.reason}")
         return 1
+    except DuplicateRequestError as e:
+        print("status: DUPLICATE")
+        print(f"detail: {e}")
+        if e.existing_grant is not None:
+            print(f"existing_grant_id: {e.existing_grant.id}")
+        else:
+            print(f"existing_approval_token: {e.existing_pending.approval_token}")
+        return 1
     except PendingHumanReviewError as e:
         pending = e.pending_approval
         print("status: PENDING_HUMAN")
@@ -94,22 +103,51 @@ def cmd_revoke(args, broker: Broker) -> int:
 
 
 def cmd_sweep(args, broker: Broker) -> int:
-    expired_count = broker.sweep_expired()
-    timed_out_count = broker.sweep_pending_timeouts()
-    print(f"expired_count: {expired_count}")
-    print(f"timed_out_count: {timed_out_count}")
-    return 0
+    """One reconcile pass by default. --loop keeps going every --interval
+    seconds (the docker-compose `sweeper` service runs this way) so expired
+    grants get torn down on the connector and stale approvals get auto-denied
+    without waiting for someone to run `sweep` by hand. --iterations bounds
+    the loop, mainly so tests can drive it."""
+    passes = 0
+    while True:
+        expired_count, timed_out_count = broker.reconcile()
+        print(f"expired_count: {expired_count}")
+        print(f"timed_out_count: {timed_out_count}")
+        passes += 1
+        if not args.loop or (args.iterations is not None and passes >= args.iterations):
+            return 0
+        sys.stdout.flush()
+        time.sleep(args.interval)
 
 
 def cmd_approve(args, broker: Broker) -> int:
     resolution = broker.resolve_approval(args.token, approve=(args.decision == "approve"), decided_by=args.by)
     print(f"resolved: {'true' if resolution.resolved else 'false'}")
     if not resolution.resolved:
-        print("detail: token unknown or already resolved")
+        print(f"detail: {resolution.reason}")
         return 1
     if resolution.grant is not None:
         print(f"grant_id: {resolution.grant.id}")
         print(f"token: {resolution.grant.token}")
+    return 0
+
+
+def cmd_show_request(args, broker: Broker) -> int:
+    """Shows a request row and where it ended up. Requests that never
+    produced a grant or a pending approval (DENIED, DUPLICATE) have no other
+    object to inspect, so this is the only way to see their outcome."""
+    request = broker.db.get_request(args.request_id)
+    if request is None:
+        print(f"error: no such request {args.request_id}")
+        return 1
+    print(f"request_id: {request.id}")
+    print(f"requester: {request.requester}")
+    print(f"resource: {request.resource}")
+    print(f"access_level: {request.access_level}")
+    print(f"duration_seconds: {request.duration_seconds}")
+    print(f"reason: {request.reason}")
+    print(f"status: {request.status.value}")
+    print(f"created_at: {request.created_at}")
     return 0
 
 
@@ -177,8 +215,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--by", required=True, help="who is revoking it")
     p_revoke.set_defaults(func=cmd_revoke)
 
-    p_sweep = sub.add_parser("sweep", help="expire any due grants")
+    p_sweep = sub.add_parser("sweep", help="expire due grants and time out stale pending approvals")
+    p_sweep.add_argument("--loop", action="store_true", help="keep sweeping every --interval seconds instead of once")
+    p_sweep.add_argument("--interval", type=int, default=30, help="seconds between passes in --loop mode (default 30)")
+    p_sweep.add_argument("--iterations", type=int, default=None, help="stop --loop after this many passes (default: forever)")
     p_sweep.set_defaults(func=cmd_sweep)
+
+    p_show_request = sub.add_parser("show-request", help="show a request and its current status")
+    p_show_request.add_argument("request_id", type=int)
+    p_show_request.set_defaults(func=cmd_show_request)
 
     p_audit = sub.add_parser("audit", help="show audit log entries")
     p_audit.add_argument("--request-id", type=int, default=None)

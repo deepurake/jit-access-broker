@@ -91,6 +91,21 @@ def test_request_command_prints_active_grant(tmp_path, capsys):
     assert grant_id.isdigit()
 
 
+def test_second_identical_request_is_reported_as_duplicate(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path))
+    grant_id = parse_field(capsys.readouterr().out, "grant_id")
+
+    exit_code = main(request_grant(db_path))
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert parse_field(output, "status") == "DUPLICATE"
+    assert "active grant exists" in parse_field(output, "detail")
+    assert parse_field(output, "existing_grant_id") == grant_id
+
+
 def test_status_command_reflects_revoke(tmp_path, capsys):
     db_path = tmp_path / "cli.db"
     seed_acl_and_role(db_path, tmp_path, capsys)
@@ -159,7 +174,59 @@ def test_audit_command_lists_full_lifecycle_in_order(tmp_path, capsys):
     main(["--db", str(db_path), "audit"])
     output = capsys.readouterr().out
     event_types = re.findall(r"event=(\w+)", output)
-    assert event_types == ["REQUESTED", "POLICY_DECIDED", "GRANTED", "REVOKED"]
+    # TRIAGED sits between REQUESTED and POLICY_DECIDED: chronologically the
+    # AI recommendation exists before the router turns it into a decision.
+    assert event_types == ["REQUESTED", "TRIAGED", "POLICY_DECIDED", "GRANTED", "REVOKED"]
+
+
+def test_audit_triaged_event_records_confidence_and_risk_flag(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path))
+    capsys.readouterr()
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    output = capsys.readouterr().out
+
+    triaged = [line for line in output.splitlines() if "event=TRIAGED" in line]
+    assert len(triaged) == 1
+    assert "APPROVE confidence=HIGH risk_flag=False" in triaged[0]
+    assert "proportionate" in triaged[0]
+
+
+def test_audit_triaged_event_shows_risk_flag_for_extended_admin_access(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+    main(
+        request_grant(
+            db_path,
+            **{"access-level": "admin"},
+            duration="7200",
+            reason="rotating leaked credentials after incident 4711",
+        )
+    )
+    capsys.readouterr()
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    output = capsys.readouterr().out
+
+    event_types = re.findall(r"event=(\w+)", output)
+    assert event_types == ["REQUESTED", "TRIAGED", "POLICY_DECIDED", "ROUTED_TO_HUMAN"]
+    triaged = [line for line in output.splitlines() if "event=TRIAGED" in line][0]
+    assert "APPROVE confidence=MEDIUM risk_flag=True" in triaged
+
+
+def test_audit_has_no_triaged_event_when_acl_denies_before_triage(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path, **{"access-level": "admin"}))
+    capsys.readouterr()
+
+    main(["--db", str(db_path), "audit", "--request-id", "1"])
+    output = capsys.readouterr().out
+
+    event_types = re.findall(r"event=(\w+)", output)
+    assert event_types == ["REQUESTED", "POLICY_DECIDED", "DENIED"]
 
 
 def test_request_command_reports_pending_human_review(tmp_path, capsys):
@@ -203,8 +270,11 @@ def test_approve_command_approves_a_pending_request(tmp_path, capsys):
     output = capsys.readouterr().out
     request_id = int(parse_field(output, "request_id"))
 
+    # The CLI runs on the real SystemClock and resolve_approval enforces the
+    # deadline at click time, so the hand-built approval must not be stale.
+    now = int(time.time())
     db = Database(str(db_path))
-    pending = db.create_pending_approval(request_id, "tok-cli-test", created_at=1000, deadline_at=1000 + 14400)
+    pending = db.create_pending_approval(request_id, "tok-cli-test", created_at=now, deadline_at=now + 14400)
 
     exit_code = main(["--db", str(db_path), "approve", pending.approval_token, "--by", "bob", "--decision", "approve"])
 
@@ -225,6 +295,7 @@ def test_approve_command_with_unknown_token_fails(tmp_path, capsys):
     assert exit_code == 1
     output = capsys.readouterr().out
     assert parse_field(output, "resolved") == "false"
+    assert parse_field(output, "detail") == "unknown approval token"
 
 
 def test_sweep_command_reports_expired_and_timed_out_counts(tmp_path, capsys):
@@ -364,6 +435,72 @@ def test_full_human_review_loop_via_cli(tmp_path, capsys):
     output = capsys.readouterr().out
     assert parse_field(output, "active") == "true"
     assert parse_field(output, "status") == "ACTIVE"
+
+
+def test_sweep_loop_runs_the_requested_number_of_passes(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "sweep", "--loop", "--interval", "0", "--iterations", "2"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert re.findall(r"^expired_count: (\d+)$", output, re.MULTILINE) == ["0", "0"]
+    assert re.findall(r"^timed_out_count: (\d+)$", output, re.MULTILINE) == ["0", "0"]
+
+
+def test_sweep_without_loop_flag_runs_exactly_once(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "sweep"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert len(re.findall(r"^expired_count:", output, re.MULTILINE)) == 1
+
+
+def test_show_request_command_prints_the_request_and_its_status(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys)
+    main(request_grant(db_path))
+    request_id = parse_field(capsys.readouterr().out, "request_id")
+
+    exit_code = main(["--db", str(db_path), "show-request", request_id])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert parse_field(output, "request_id") == request_id
+    assert parse_field(output, "requester") == "alice"
+    assert parse_field(output, "resource") == "prod-db"
+    assert parse_field(output, "access_level") == "read"
+    assert parse_field(output, "duration_seconds") == "3600"
+    assert parse_field(output, "reason") == "debugging incident 123"
+    assert parse_field(output, "status") == "AUTO_APPROVED"
+    assert parse_field(output, "created_at").isdigit()
+
+
+def test_show_request_command_reflects_human_approval(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+    seed_acl_and_role(db_path, tmp_path, capsys, requester="alice", role="oncall")
+    main(request_grant(db_path, **{"access-level": "admin"}, duration="7200", reason="rotating leaked credentials after incident 4711"))
+    token = parse_field(capsys.readouterr().out, "approval_token")
+
+    main(["--db", str(db_path), "show-request", "1"])
+    assert parse_field(capsys.readouterr().out, "status") == "PENDING_HUMAN"
+
+    main(["--db", str(db_path), "approve", token, "--by", "bob", "--decision", "approve"])
+    capsys.readouterr()
+
+    main(["--db", str(db_path), "show-request", "1"])
+    assert parse_field(capsys.readouterr().out, "status") == "HUMAN_APPROVED"
+
+
+def test_show_request_command_with_unknown_id_fails(tmp_path, capsys):
+    db_path = tmp_path / "cli.db"
+
+    exit_code = main(["--db", str(db_path), "show-request", "42"])
+
+    assert exit_code == 1
+    assert capsys.readouterr().out.strip() == "error: no such request 42"
 
 
 def test_triage_claude_flag_is_accepted_by_parser():

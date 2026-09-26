@@ -53,10 +53,17 @@ class DecisionRouter(PolicyEngine):
             and triage_result.recommendation == TriageRecommendation.APPROVE
             and not triage_result.risk_flag
         )
-        if is_confidently_fine:
-            return PolicyDecision(decision=PolicyDecisionType.AUTO_APPROVE, reason=triage_result.justification)
-
-        return PolicyDecision(decision=PolicyDecisionType.ROUTE_HUMAN, reason=triage_result.justification)
+        decision = PolicyDecisionType.AUTO_APPROVE if is_confidently_fine else PolicyDecisionType.ROUTE_HUMAN
+        # Carry the full triage signal, not just the flattened justification,
+        # so the audit log can show why the AI recommended what it did.
+        return PolicyDecision(
+            decision=decision,
+            reason=triage_result.justification,
+            triage_recommendation=triage_result.recommendation.value,
+            triage_confidence=triage_result.confidence.value,
+            triage_risk_flag=triage_result.risk_flag,
+            triage_justification=triage_result.justification,
+        )
 
     @staticmethod
     def _defer_to_human(what_failed: str, exc: Exception) -> PolicyDecision:

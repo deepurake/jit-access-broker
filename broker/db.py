@@ -12,6 +12,7 @@ from broker.models import (
     PendingApproval,
     PendingApprovalStatus,
     Request,
+    RequestStatus,
 )
 
 SCHEMA = """
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS requests (
     access_level TEXT NOT NULL,
     duration_seconds INTEGER NOT NULL,
     reason TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING_POLICY'
 );
 
 CREATE TABLE IF NOT EXISTS grants (
@@ -85,7 +87,18 @@ class Database:
         self._conn = sqlite3.connect(path)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        self._migrate_requests_status_column()
         self._conn.commit()
+
+    def _migrate_requests_status_column(self) -> None:
+        """CREATE TABLE IF NOT EXISTS leaves an existing table alone, so a
+        SQLite file created before requests.status existed (e.g. one already
+        sitting in a docker volume) needs the column added on open."""
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(requests)")}
+        if "status" not in columns:
+            self._conn.execute(
+                f"ALTER TABLE requests ADD COLUMN status TEXT NOT NULL DEFAULT '{RequestStatus.PENDING_POLICY.value}'"
+            )
 
     def create_request(self, requester, resource, access_level, duration_seconds, reason, at) -> int:
         cur = self._conn.execute(
@@ -108,7 +121,12 @@ class Database:
             duration_seconds=row["duration_seconds"],
             reason=row["reason"],
             created_at=row["created_at"],
+            status=RequestStatus(row["status"]),
         )
+
+    def set_request_status(self, request_id: int, status: RequestStatus) -> None:
+        self._conn.execute("UPDATE requests SET status = ? WHERE id = ?", (status.value, request_id))
+        self._conn.commit()
 
     def create_grant(self, request_id, requester, resource, access_level, token, granted_at, expires_at) -> Grant:
         cur = self._conn.execute(
@@ -138,6 +156,17 @@ class Database:
         if grant is None:
             return False
         return grant.status == GrantStatus.ACTIVE and grant.expires_at > now
+
+    def find_active_grant(self, requester: str, resource: str, access_level: str, now: int) -> Optional[Grant]:
+        """Newest grant for this exact (requester, resource, access_level)
+        that is still live -- same expires_at > now rule as is_grant_active,
+        so a grant the sweeper hasn't reached yet still counts as expired."""
+        row = self._conn.execute(
+            "SELECT * FROM grants WHERE requester = ? AND resource = ? AND access_level = ? "
+            "AND status = ? AND expires_at > ? ORDER BY id DESC LIMIT 1",
+            (requester, resource, access_level, GrantStatus.ACTIVE.value, now),
+        ).fetchone()
+        return self._row_to_grant(row) if row is not None else None
 
     def _transition_grant(self, grant_id: int, to_status: GrantStatus, from_status: GrantStatus = GrantStatus.ACTIVE) -> bool:
         """Guarded state transition: only affects a row still in `from_status`.
@@ -270,6 +299,18 @@ class Database:
     def get_pending_approval_by_token(self, approval_token: str) -> Optional[PendingApproval]:
         row = self._conn.execute(
             "SELECT * FROM pending_approvals WHERE approval_token = ?", (approval_token,)
+        ).fetchone()
+        return self._row_to_pending_approval(row) if row is not None else None
+
+    def find_pending_approval(self, requester: str, resource: str, access_level: str) -> Optional[PendingApproval]:
+        """Newest still-PENDING approval whose underlying request matches this
+        exact (requester, resource, access_level). pending_approvals doesn't
+        denormalise those fields, so join back to requests."""
+        row = self._conn.execute(
+            "SELECT pa.* FROM pending_approvals pa JOIN requests r ON r.id = pa.request_id "
+            "WHERE pa.status = ? AND r.requester = ? AND r.resource = ? AND r.access_level = ? "
+            "ORDER BY pa.id DESC LIMIT 1",
+            (PendingApprovalStatus.PENDING.value, requester, resource, access_level),
         ).fetchone()
         return self._row_to_pending_approval(row) if row is not None else None
 

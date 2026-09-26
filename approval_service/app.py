@@ -112,11 +112,11 @@ def create_app(broker: Broker) -> Flask:
 
         resolution = broker.resolve_approval(token, approve=(decision == "approve"), decided_by=decided_by)
         if not resolution.resolved:
-            return message(
-                "Link no longer valid",
-                "This approval link is no longer valid (already decided, expired, or unknown).",
-                409,
-            )
+            # 409 for every refusal: the client's request conflicts with the
+            # approval's current state (decided, timed out, unknown) or with
+            # who is allowed to decide it (the requester). The broker's reason
+            # says which, so the reviewer isn't left guessing.
+            return message("Link no longer valid", f"This approval link was not accepted: {resolution.reason}.", 409)
         if resolution.grant is not None:
             return message("Approved", f"Approved -- grant #{resolution.grant.id} issued.", 200)
         return message("Denied", "Denied -- no access was granted.", 200)
@@ -137,4 +137,8 @@ if __name__ == "__main__":
     # Broker.resolve_approval, which never consults the policy -- the routing
     # decision was already made (and audited) when the request came in.
     broker = Broker(db=db, policy=AlwaysApprovePolicy(), connector=connector)
+    # Boot reconciliation: anything that expired or timed out while no
+    # process was running gets torn down / auto-denied before we serve a
+    # single click, instead of waiting for the next sweeper pass.
+    broker.reconcile()
     create_app(broker).run(host="0.0.0.0", port=8083)

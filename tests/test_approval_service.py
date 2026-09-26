@@ -167,6 +167,33 @@ def test_post_approve_twice_second_is_409_and_no_double_grant(env):
     assert db.get_pending_approval_by_token(token).decided_by == "bob"
 
 
+def test_post_by_the_requester_is_409_and_leaves_pending(env):
+    """Self-approval is refused but does not consume the link -- another
+    reviewer can still act on it -- and the page says why."""
+    broker, db, connector, client = env
+    token = _route_to_human(broker)  # requester is alice
+
+    resp = client.post(f"/approve/{token}/decide", data={"decision": "approve", "decided_by": "alice"})
+
+    assert resp.status_code == 409
+    assert b"own request" in resp.data
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.PENDING
+
+
+def test_post_after_deadline_is_409_and_times_out_without_a_sweep(env):
+    broker, db, connector, client = env
+    token = _route_to_human(broker)
+    broker.clock.advance(broker.approval_deadline_seconds + 1)
+
+    resp = client.post(f"/approve/{token}/decide", data={"decision": "approve", "decided_by": "bob"})
+
+    assert resp.status_code == 409
+    assert b"timed_out" in resp.data
+    assert connector.issued == []
+    assert db.get_pending_approval_by_token(token).status == PendingApprovalStatus.TIMED_OUT
+
+
 def test_post_unknown_token_is_409(env):
     broker, db, connector, client = env
 
