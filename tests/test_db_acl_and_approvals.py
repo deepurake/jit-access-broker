@@ -1,7 +1,7 @@
 """
-Evals for the three schema additions that back the ACL policy engine,
-user-role directory, and human-approval flow: user_roles, acl_rules, and
-pending_approvals. Same guarded-transition pattern as grants (db.py) --
+Evals for the schema additions that back the ACL policy engine, user-role
+directory, and human-approval flow: user_roles, acl_rules, approver_roles
+and pending_approvals. Same guarded-transition pattern as grants (db.py) --
 resolve_pending_approval and sweep_pending_timeouts are both conditional
 UPDATE ... WHERE status='PENDING', for the same race-safety reason.
 """
@@ -63,6 +63,77 @@ def test_load_acl_rules_replaces_previous_rules(tmp_path):
     rules = db.get_acl_rules_for_role("engineer")
     assert len(rules) == 1
     assert rules[0]["resource_pattern"] == "staging-db"
+
+
+# -- approver_roles: is_approver = known user AND their role is an approver role -- #
+
+
+def test_is_approver_true_for_a_known_user_holding_an_approver_role(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security", "oncall"])
+    db.set_user_role("bob", "security")
+    db.set_user_role("carol", "oncall")
+
+    assert db.is_approver("bob") is True
+    assert db.is_approver("carol") is True
+
+
+def test_is_approver_false_for_a_known_user_without_an_approver_role(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security"])
+    db.set_user_role("alice", "engineer")
+
+    assert db.is_approver("alice") is False
+
+
+def test_is_approver_false_for_an_unknown_name(tmp_path):
+    db = make_db(tmp_path)
+    db.load_approver_roles(["security"])
+
+    assert db.is_approver("rakesh") is False
+
+
+def test_is_approver_false_for_everyone_when_no_approver_roles_are_loaded(tmp_path):
+    """Fail closed: an empty approver_roles table means nobody can approve,
+    even a user who holds a role that WOULD be an approver role once loaded."""
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+
+    assert db.is_approver("bob") is False
+
+
+def test_load_approver_roles_replaces_the_previous_set(tmp_path):
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+    db.set_user_role("carol", "oncall")
+    db.load_approver_roles(["security", "oncall"])
+    assert db.is_approver("bob") is True and db.is_approver("carol") is True
+
+    db.load_approver_roles(["oncall"])
+
+    assert db.is_approver("bob") is False
+    assert db.is_approver("carol") is True
+
+
+def test_load_approver_roles_with_an_empty_list_clears_the_table(tmp_path):
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+    db.load_approver_roles(["security"])
+
+    db.load_approver_roles([])
+
+    assert db.is_approver("bob") is False
+
+
+def test_load_approver_roles_tolerates_a_repeated_role(tmp_path):
+    """The YAML author listing a role twice is not an error (PRIMARY KEY
+    would otherwise make the replace-all blow up half-way)."""
+    db = make_db(tmp_path)
+    db.set_user_role("bob", "security")
+
+    db.load_approver_roles(["security", "security"])
+
+    assert db.is_approver("bob") is True
 
 
 def test_create_and_fetch_pending_approval(tmp_path):
@@ -135,6 +206,43 @@ def test_sweep_pending_timeouts_ignores_approvals_not_yet_due(tmp_path):
 
     assert timed_out == []
     assert db.get_pending_approval_by_token("tok-abc123").status == PendingApprovalStatus.PENDING
+
+
+def test_find_pending_approval_matches_on_the_requests_tuple(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "admin", 3600, "reason", at=1000)
+    db.create_pending_approval(request_id, "tok-abc123", created_at=1000, deadline_at=5000)
+
+    found = db.find_pending_approval("alice", "prod-db", "admin")
+
+    assert found is not None
+    assert found.approval_token == "tok-abc123"
+    # different access level, different requester -> not the same access
+    assert db.find_pending_approval("alice", "prod-db", "read") is None
+    assert db.find_pending_approval("bob", "prod-db", "admin") is None
+
+
+def test_find_pending_approval_ignores_decided_approvals(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "admin", 3600, "reason", at=1000)
+    db.create_pending_approval(request_id, "tok-abc123", created_at=1000, deadline_at=5000)
+    db.resolve_pending_approval("tok-abc123", PendingApprovalStatus.DENIED, decided_by="bob", now=2000)
+
+    assert db.find_pending_approval("alice", "prod-db", "admin") is None
+
+
+def test_find_active_grant_respects_status_and_expiry(tmp_path):
+    db = make_db(tmp_path)
+    request_id = db.create_request("alice", "prod-db", "read", 600, "reason", at=1000)
+    grant = db.create_grant(request_id, "alice", "prod-db", "read", "tok", granted_at=1000, expires_at=1600)
+
+    assert db.find_active_grant("alice", "prod-db", "read", now=1500).id == grant.id
+    # expired by the clock even though no sweep has flipped the row yet
+    assert db.find_active_grant("alice", "prod-db", "read", now=1600) is None
+    assert db.find_active_grant("alice", "prod-db", "write", now=1500) is None
+
+    db.revoke_grant(grant.id)
+    assert db.find_active_grant("alice", "prod-db", "read", now=1500) is None
 
 
 def test_sweep_does_not_time_out_an_already_decided_approval(tmp_path):

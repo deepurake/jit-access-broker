@@ -1,12 +1,14 @@
 """
-Evals for broker.acl_loader.load_acl_yaml -- parses the human-authored,
-git-reviewed acl.yaml (nested role -> list-of-rules shape) into the flat
-list-of-dicts shape Database.load_acl_rules() expects, so the call site is
-just `db.load_acl_rules(load_acl_yaml("acl.yaml"))`.
+Evals for broker.acl_loader -- parses the human-authored, git-reviewed
+acl.yaml. load_acl_yaml turns the nested role -> list-of-rules shape into the
+flat list-of-dicts shape Database.load_acl_rules() expects, so the call site
+is just `db.load_acl_rules(load_acl_yaml("acl.yaml"))`; load_approver_roles
+reads the top-level `approver_roles:` list (who may decide a human review).
 """
-from broker.acl_loader import load_acl_yaml
+from broker.acl_loader import load_acl_yaml, load_approver_roles
 
 YAML_TEXT = """\
+approver_roles: [security, oncall]
 roles:
   engineer:
     - resource_pattern: "prod-db"
@@ -85,3 +87,37 @@ def test_empty_roles_section_yields_empty_list(tmp_path):
     rules = load_acl_yaml(path)
 
     assert rules == []
+
+
+# -- approver_roles: which roles may decide a pending human review -- #
+
+
+def test_load_approver_roles_returns_the_listed_roles_in_order(tmp_path):
+    path = write_yaml(tmp_path)
+
+    assert load_approver_roles(path) == ["security", "oncall"]
+
+
+def test_load_approver_roles_is_empty_when_the_key_is_absent(tmp_path):
+    """No `approver_roles:` means nobody is an approver (fail closed), not a
+    crash and not some implicit default."""
+    path = write_yaml(tmp_path, text="roles: {}\n")
+
+    assert load_approver_roles(path) == []
+
+
+def test_load_approver_roles_accepts_a_block_list_too(tmp_path):
+    path = write_yaml(tmp_path, text="approver_roles:\n  - security\nroles: {}\n")
+
+    assert load_approver_roles(path) == ["security"]
+
+
+def test_load_approver_roles_does_not_change_load_acl_yaml(tmp_path):
+    """The two keys are independent: approver_roles is not a role with rules,
+    and a role can appear in both (oncall people request AND approve)."""
+    path = write_yaml(tmp_path)
+
+    rules = load_acl_yaml(path)
+
+    assert len(rules) == 4
+    assert "security" not in {r["role"] for r in rules}

@@ -1,15 +1,18 @@
 """The human-review half of the JIT broker: a magic-link web app. A request
-the DecisionRouter couldn't confidently auto-approve lands here as a
+the PolicyEngine couldn't confidently auto-approve lands here as a
 single-use URL. GET renders what's being asked (including the AI triage
 justification) so the reviewer can decide; the decision itself is a POST so
 a bare link can never approve access on its own. No login -- the unguessable
 single-use token is the credential, and Broker.resolve_approval enforces
-single-use with a guarded DB transition."""
+single-use with a guarded DB transition. The name typed into the form is a
+claim, not an identity: the broker checks it names a known user holding an
+approver role (authorization of the claim), but nothing here proves the
+person typing it is that user. SSO on this page is the next step."""
 import os
 
 from flask import Flask, abort, render_template_string, request
 
-from broker.broker import Broker
+from broker.broker import SUGGESTED_MINIMUM_SEPARATOR, Broker
 from broker.models import AuditEventType, PendingApprovalStatus
 
 NO_JUSTIFICATION = "(no justification recorded)"
@@ -42,8 +45,14 @@ REVIEW_PAGE = """<!doctype html>
   </dl>
 
   <h2>Why this needs a human</h2>
+  {% if escalation_note is not none %}
+  <p><strong>Escalated by the requester: {{ escalation_note }}</strong></p>
+  {% endif %}
   <p>The AI triage step did not auto-approve this request. Its justification:</p>
   <blockquote>{{ justification }}</blockquote>
+  {% if suggested_minimum is not none %}
+  <p><strong>Suggested minimum:</strong> {{ suggested_minimum }}</p>
+  {% endif %}
 
   {% if pending.status == PendingApprovalStatus.PENDING %}
   <form method="post" action="/approve/{{ token }}/decide">
@@ -73,6 +82,20 @@ MESSAGE_PAGE = """<!doctype html>
 """
 
 
+def _split_suggested_minimum(detail: str):
+    """A ROUTED_TO_HUMAN detail may end in ` | suggested minimum: write/3600s`
+    (Broker appends it when triage found the request over-scoped). Returns
+    (justification, "write for 3600s") -- or (detail, None) when there is
+    no such suffix -- so the page can label the alternative on its own line
+    instead of burying it in the justification. No schema change: the audit
+    detail is the record, this only parses it back for display."""
+    justification, separator, suggestion = detail.partition(SUGGESTED_MINIMUM_SEPARATOR)
+    if not separator:
+        return detail, None
+    level, slash, duration = suggestion.partition("/")
+    return justification, f"{level} for {duration}" if slash else suggestion
+
+
 def create_app(broker: Broker) -> Flask:
     app = Flask(__name__)
 
@@ -86,11 +109,19 @@ def create_app(broker: Broker) -> Flask:
             abort(404)
         req = broker.db.get_request(pending.request_id)
 
+        # The LAST ROUTED_TO_HUMAN event is the one this approval came from
+        # (get_audit_log is ordered by id, so iterating without a break keeps
+        # the latest). An escalated request has exactly one, carrying what
+        # the AI originally objected to; the ESCALATED event (if any) is the
+        # requester's own note explaining why a human should look anyway.
         justification = NO_JUSTIFICATION
+        escalation_note = None
         for event in broker.db.get_audit_log(request_id=pending.request_id):
             if event.event_type == AuditEventType.ROUTED_TO_HUMAN:
                 justification = event.detail
-                break
+            elif event.event_type == AuditEventType.ESCALATED:
+                escalation_note = event.detail.split(": ", 1)[-1]
+        justification, suggested_minimum = _split_suggested_minimum(justification)
 
         return render_template_string(
             REVIEW_PAGE,
@@ -98,6 +129,8 @@ def create_app(broker: Broker) -> Flask:
             pending=pending,
             req=req,
             justification=justification,
+            suggested_minimum=suggested_minimum,
+            escalation_note=escalation_note,
             PendingApprovalStatus=PendingApprovalStatus,
         )
 
@@ -112,11 +145,12 @@ def create_app(broker: Broker) -> Flask:
 
         resolution = broker.resolve_approval(token, approve=(decision == "approve"), decided_by=decided_by)
         if not resolution.resolved:
-            return message(
-                "Link no longer valid",
-                "This approval link is no longer valid (already decided, expired, or unknown).",
-                409,
-            )
+            # 409 for every refusal: the client's request conflicts with the
+            # approval's current state (decided, timed out, unknown) or with
+            # who is allowed to decide it (the requester themselves, or a name
+            # that is not a known approver). The broker's reason says which,
+            # so the reviewer isn't left guessing.
+            return message("Link no longer valid", f"This approval link was not accepted: {resolution.reason}.", 409)
         if resolution.grant is not None:
             return message("Approved", f"Approved -- grant #{resolution.grant.id} issued.", 200)
         return message("Denied", "Denied -- no access was granted.", 200)
@@ -137,4 +171,10 @@ if __name__ == "__main__":
     # Broker.resolve_approval, which never consults the policy -- the routing
     # decision was already made (and audited) when the request came in.
     broker = Broker(db=db, policy=AlwaysApprovePolicy(), connector=connector)
-    create_app(broker).run(host="0.0.0.0", port=8083)
+    # Boot reconciliation: anything that expired or timed out while no
+    # process was running gets torn down / auto-denied before we serve a
+    # single click, instead of waiting for the next sweeper pass.
+    broker.reconcile()
+    # The Database holds one SQLite connection; the dev server must not run
+    # requests concurrently on it.
+    create_app(broker).run(host="0.0.0.0", port=8083, threaded=False)

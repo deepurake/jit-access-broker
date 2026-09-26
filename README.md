@@ -1,215 +1,46 @@
-# Just-in-Time Access Broker — Build Plan
+# JIT Access Broker
 
-# Question:
-Just-in-Time Access Broker
+A small service that brokers just-in-time access. Someone asks for time-boxed
+access to a resource with a reason; a policy engine decides -- auto-approve,
+return it to the requester, send it to a human, or deny -- and records why; an
+AI step recommends but never decides; approved grants expire on their own; and
+everything lands in an append-only audit log. The external identity provider
+and the protected resource are mocked behind interfaces (an in-process mock and
+a fake Okta sidecar over HTTP), so the brokering logic is what's under test.
 
+## Reviewers: start here
 
+Everything written for people is in [`docs_for_evaluators/`](docs_for_evaluators/):
 
-Background
+1. [`instructions_to_tryout.md`](docs_for_evaluators/instructions_to_tryout.md) -- bring the stack up with Docker Compose and click through a request, an approval, a denial.
+2. [`Design.md`](docs_for_evaluators/Design.md) -- how a request is decided, in plain language, plus the state machines and the key decisions.
+3. [`REPORT.md`](docs_for_evaluators/REPORT.md) -- architecture decisions with motivations, the edge cases from the brief, and the known gaps.
+4. [`cli_walkthrough.md`](docs_for_evaluators/cli_walkthrough.md) -- every path driven from the CLI with real output, including the ones that auto-approve, route to a human, and get denied.
+5. [`brief.md`](docs_for_evaluators/brief.md) -- the original assignment, verbatim.
 
-
-
-We'd want people and agents to request access to a resource when they need it, for a bounded window, and have it disappear on its own. And we don’t want approvers to have to sit around acting as an approval desk. We want to make short-lived access easy to request, safe to grant while pulling a human into the loop only as an exception.
-
-Build a service with UI or CLI that brokers just-in-time access: a user requests time-boxed access to a resource, a policy engine decides whether to auto-approve, route to a human, or deny; approved grants expire on their own; and everything lands in an audit trail.
-
-
-
-Requirements
-
-
-
-A zip file that contains your code.
-A README for how to run the app, plus example requests to test — including ones that auto-approve, ones that route to a human, and ones that get denied.
-A short report of architecture decisions with motivations.
-Core:
-A user can request time-boxed access: resource, access level, duration, and a reason.
-A policy engine decides each request — auto-approve / route to a human / deny — and records why.
-Requests routed to a human can be approved or denied, and the requester ends up with (or without) a grant accordingly.
-Grants are time-boxed and expire automatically; an expired or revoked grant is no longer active.
-The actual "grant" is mocked behind an interface (e.g. a fake Okta / AWS / Workspace call) — the workflow and policy are the point, not real integrations.
-An append-only audit log captures every request, decision, grant, expiry, and revocation.
-An AI triage step recommends a decision with a short justification for requests that aren't trivially auto-approved or denied, and defers to a human when it isn't confident. (You may mock the model call, but the recommend-and-defer behavior should be real.)
-
-
-Worth thinking about
-
-
-
-You decide how far to take each of these. We mostly care about the choices you make and why.
-How policy is expressed — could a non-engineer security person understand it?
-What happens when the approver is asleep: defaults, escalation, expiry of pending requests.
-Races between grant, expiry, and revocation landing at the same time.
-Concurrent or duplicate requests for the same access.
-Where AI genuinely helps triage vs. where trusting it is too risky.
-Least privilege on the duration and level: do you grant exactly what was asked, or the minimum that fits the reason?
-How you'd swap the mocked grant for a real Okta / Workspace / AWS connector later.
-
-
-Notes
-
-
-
-Total time is ~6 hours. Budget roughly 4 to build, 1 to QA, 1 to review the code. A tight, working broker beats a broad, half-built one; if you run out of time, write down what's left.
-Use whatever stack and LLM provider you're most comfortable with. Raw provider SDKs (the anthropic / openai clients) are fine — but build the request → decision → grant state machine yourself; don't hand the orchestration to an agent framework.
-Mock external systems (identity providers, the resources themselves) behind clean interfaces. We're evaluating the brokering logic, not integration plumbing.
-Make reasonable assumptions and note them. Handle the edge cases you think matter (approver never responds, a grant expires mid-revoke, duplicate requests, the model returns garbage, the service restarts with grants still outstanding).
-Spend ~15 minutes writing the reasoning behind your decisions.
-
-
-
-
-
-Words: 1
-If your submission is larger than 10 MB, feel free to compress the file and upload to a google drive. And share the link with us below.
-
-## Stack & Interface
-- **Python 3.11 + FastAPI** for the service — exposes a REST API that both a CLI and `curl` examples can hit.
-- **SQLite** (stdlib `sqlite3`, no ORM) for persistence — durable across restarts; single-writer transaction model
-  gives correct handling of the grant/expire/revoke race for free (conditional `UPDATE ... WHERE status='ACTIVE'`,
-  whoever commits first wins, the loser is a no-op).
-- **CLI (`click`)** as a thin wrapper over the same API — satisfies "UI or CLI" and gives scriptable demo commands.
-
-## Core Design Decisions
-1. **State machine**: `Request` → `PENDING_POLICY` → (`AUTO_APPROVED` / `PENDING_HUMAN` / `DENIED`) → human path
-   resolves to `APPROVED`/`DENIED`. `Grant` → `ACTIVE` → `EXPIRED` | `REVOKED`. All transitions are guarded,
-   conditional DB writes — no in-memory state, so a service restart just resumes from SQLite (a boot-time sweep
-   reconciles anything that expired while the service was down).
-2. **Policy engine as data, not code**: a YAML file of rules (resource pattern, access level, max duration,
-   condition → decision) that a security person can read/edit without touching Python. Engine evaluates rules
-   top-down: clear allow → auto-approve, clear deny → deny, everything else → AI triage.
-3. **AI triage**: only invoked for the gray zone. `TriageProvider` interface with a `MockTriageProvider`
-   (deterministic heuristic standing in for the model) and a real Claude-backed implementation behind
-   `ANTHROPIC_API_KEY` — same interface, swappable. If the response doesn't parse or confidence is low, it defers
-   to a human — the "recommend and defer" behavior the spec calls out.
-4. **Expiry**: derived at read-time (`expires_at <= now` ⇒ inactive) *and* a background sweeper thread that flips
-   status + writes the audit event, so both "is it active right now" and "when did it actually expire" stay
-   correct even if the sweeper is lagging.
-5. **Pending-human timeout**: each human-routed request gets a policy-configurable `response_deadline`. A sweeper
-   auto-denies stale pending requests and logs "approval timeout" — the answer to "approver is asleep."
-6. **Duplicate/concurrent requests**: a uniqueness check on (requester, resource, access level) against existing
-   PENDING/ACTIVE rows inside the same transaction — a second request is rejected with a pointer to the existing
-   one instead of creating a duplicate grant.
-7. **Mocked grant backend**: `ResourceConnector` interface (`grant`/`revoke`), one `MockConnector` implementation
-   that just logs the "API call" — the seam where a real Okta/AWS/Workspace SDK call would go later.
-8. **Audit log**: append-only SQLite table, insert-only (no update/delete path exposed), one row per event
-   (`REQUESTED`, `POLICY_DECIDED`, `TRIAGED`, `HUMAN_DECIDED`, `GRANTED`, `EXPIRED`, `REVOKED`).
-
-## Deliverables
-- `broker/` source
-- `README.md` — run instructions + example requests (auto-approve / human-route / deny)
-- `REPORT.md` — architecture rationale
-- Zipped project at the end
-- Tests for the policy engine and the race-condition logic
-
-## Component Timeline (~6h budget)
-
-| # | Component | Est. | Notes |
-|---|-----------|------|-------|
-| 1 | Skeleton | 45m | DB schema, FastAPI app, one endpoint, mock connector, end-to-end happy path |
-| 2 | Policy engine | 1h | YAML rules + evaluator + tests |
-| 3 | AI triage | 45m | `TriageProvider` interface + mock provider + defer-on-low-confidence logic |
-| 4 | Human approval flow | 1h | Approve/deny endpoints + pending-request timeout sweeper |
-| 5 | Expiry & revocation | 1h | Expiry sweeper + race handling + tests |
-| 6 | CLI + README | 45m | `click` CLI, run instructions, example requests |
-| 7 | QA + REPORT.md | 45m | End-to-end pass, edge cases, architecture write-up |
-
-## Stage 1 — Walking Skeleton (JIT token disbursement, end to end)
-
-Scope, deliberately narrowed to prove the core loop before building the full policy engine,
-AI triage, and human-approval flow described above:
-
-- `broker/clock.py` — `Clock` seam (`SystemClock` / `FakeClock`) so expiry is testable without sleeping.
-- `broker/models.py` — `Grant`, `AuditEvent`, `PolicyDecision`, and their status/type enums.
-- `broker/connector.py` — `ResourceConnector` seam + `MockConnector` (stands in for Okta/AWS/Workspace).
-- `broker/policy.py` — `PolicyEngine` seam + `AlwaysApprovePolicy` (stage-1 placeholder; real rules come later).
-- `broker/db.py` — SQLite persistence (file-based, not in-memory) with guarded state transitions:
-  expiry and revocation are both conditional `UPDATE ... WHERE status='ACTIVE'`, so whichever lands
-  first wins atomically and the other is a no-op — this is the race-condition answer from the spec.
-- `broker/broker.py` — `Broker`, the orchestrator: `request_access`, `is_active`, `revoke`, `sweep_expired`.
-
-Run the evals (they're real tests, not smoke checks — each one fails under a plausible bug mutation):
+## Quick check
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest tests/test_broker_e2e.py -v
-```
+pytest                      # unit + integration tests, no Docker needed
 
-`tests/test_broker_e2e.py` covers, against a real (file-based) SQLite test database per test:
-1. A request auto-approves and issues an active, tokenized grant immediately.
-2. A grant becomes inactive the instant its duration elapses, even before a sweep runs (expiry is
-   derived at read-time), and the sweep then persists that as `EXPIRED`.
-3. Revoking an active grant deactivates it immediately and calls the mock connector's `revoke`.
-4. The audit log captures the full `REQUESTED → POLICY_DECIDED → GRANTED → EXPIRED` lifecycle.
-5. An already-`EXPIRED` grant cannot be flipped to `REVOKED` (guards the expire/revoke race).
-6. A brand-new `Broker`/`Database` pointed at the same file recovers grant state after a simulated
-   process restart.
-
-**Status: Stage 1 done.** A CLI (`broker/cli.py`) was added on top: `python3 -m broker.cli --db
-broker.db request|status|revoke|sweep|audit ...`. Not yet built: real policy rules (YAML-driven),
-human approval routing + pending-request timeout, AI triage, duplicate-request rejection. Those
-remain for a later stage, to be layered on top of these same seams.
-
-## Stage 2 — Real HTTP integration (fake Okta sidecar + a protected test service)
-
-Stage 1's `MockConnector` proves the workflow but never leaves the process — `connector.issued`
-and `connector.revoked` are just Python lists. This stage proves the same `ResourceConnector` seam
-works over a real network boundary, and in doing so it surfaced (and fixed) a real bug: **expiry
-was never tearing down the external grant.** `Broker.sweep_expired` updated the broker's own
-database to `EXPIRED` but never called `connector.revoke(...)`, so an expired-per-the-broker grant
-kept working everywhere else. Fixed in `broker/broker.py`; `tests/test_broker_e2e.py`'s
-`test_expired_grant_cannot_be_revoked` was updated to assert the connector *is* called once on
-expiry (and not called again by a subsequent no-op `revoke()`).
-
-**New pieces:**
-- `broker/http_connector.py` — `HttpResourceConnector`, a second `ResourceConnector` implementation
-  that POSTs to a real HTTP service instead of appending to an in-memory list. Same interface,
-  same call sites in `Broker` — this is the shape a real Okta/AWS/Workspace connector would take.
-- `sidecar/app.py` — a fake Okta sidecar (Flask): `POST /grants` issues a token, `GET
-  /introspect/<token>` reports whether it's active, `POST /grants/<token>/revoke` deactivates it.
-  In-memory, per-process state — it's a test double standing in for a real IdP, not a persistence
-  layer.
-- `protected_service/app.py` — the "protected resource" that requires authentication: `GET /data`
-  with `Authorization: Bearer <token>`, authorized by asking a `TokenIntrospector` (same
-  strategy-pattern seam used elsewhere) whether the sidecar still considers the token active.
-
-**Design tradeoff — introspection vs. stateless verification:** this asks the sidecar on every
-request ("is this token still active?") rather than verifying a self-contained signed token
-locally. That's the opposite of how Teleport does it — Teleport issues short-lived signed
-certificates that nodes verify locally with no network round-trip, and handles revocation via short
-TTLs plus a periodically-synced lock/CRL list, trading immediate revocation for scale. Our spec
-requires a revoked or expired grant to be "no longer active," full stop, so synchronous
-introspection is the correct choice here even though it doesn't scale the way Teleport's model
-does. Worth revisiting if request volume ever made per-request introspection a bottleneck.
-
-**Why Docker Compose and not Kubernetes:** a real k8s sidecar needs a running cluster (minikube/kind)
-just to prove a mocked integration — a lot of infrastructure for something the spec explicitly says
-to keep mocked. Compose proves the same "broker talks to a separate process over the network" point
-with one command and no cluster dependency.
-
-**Running it:**
-
-```bash
 docker compose up --build --abort-on-container-exit --exit-code-from test-runner
-docker compose down
+docker compose down -v      # the same integration tests against real containers
 ```
 
-This builds three containers (`okta-sidecar`, `protected-resource`, `test-runner`), and the
-`test-runner` runs `tests/test_integration.py` against the other two over the real Docker network,
-exiting non-zero if anything fails. The same test file also runs under plain `pytest` with no
-Docker at all: `tests/conftest.py`'s `sidecar_url`/`protected_service_url` fixtures start real
-instances of both services in background threads when `SIDECAR_URL`/`PROTECTED_SERVICE_URL` aren't
-set in the environment, and point at the live containers when they are — one set of assertions,
-validated both ways.
+## Layout
 
-`tests/test_integration.py` covers:
-1. A broker-issued grant's token gets real `200` access from the protected service.
-2. A token nobody ever issued is rejected (`401`).
-3. Revoking the grant through the broker immediately blocks the protected service.
-4. Letting the grant expire (via `sweep_expired`) immediately blocks the protected service too —
-   this is the regression test for the bug this stage found and fixed.
-
-**Status: Stage 2 done**, 12 new tests (`test_sidecar.py`, `test_http_connector.py`,
-`test_http_introspector.py`, `test_protected_service.py`, `test_integration.py`) plus the 1 updated
-stage-1 test, all green both under plain `pytest` and under `docker compose`.
+```
+broker/                 the broker: models, SQLite store, policy engine, LLM triage,
+                        requester history, connectors, CLI
+approval_service/       the human-review web page (magic link)
+sidecar/                fake Okta: issue / introspect / revoke tokens
+protected_service/      a resource that checks tokens with the sidecar
+tests/                  the executable spec
+acl.yaml                who may ask for what, and who may approve
+docker-compose.yml      sidecar, protected resource, approval service, sweeper, test-runner
+docs_for_evaluators/    everything above, for people
+docs/agent_build_plans_not_for_humans/
+                        task plans written for the AI agents that built this; kept for traceability
+```

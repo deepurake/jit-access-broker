@@ -4,30 +4,36 @@ the way a real CLI is used -- this is not an in-memory demo harness."""
 import argparse
 import os
 import sys
+import time
 from typing import Optional
 
-from broker.acl_loader import load_acl_yaml
+from broker.acl_loader import load_acl_yaml, load_approver_roles
 from broker.acl_policy import AclPolicyEngine
 from broker.broker import Broker
 from broker.connector import MockConnector
 from broker.db import Database
-from broker.decision_router import DecisionRouter
+from broker.policy_engine import PolicyEngine
 from broker.http_connector import HttpResourceConnector
-from broker.models import AccessDeniedError, PendingHumanReviewError
-from broker.triage import ClaudeTriageProvider, MockTriageProvider
+from broker.models import AccessDeniedError, DuplicateRequestError, PendingApproval, PendingHumanReviewError, ReturnedToRequesterError
+from broker.llm_decision_agent import ClaudeTriageProvider, MockTriageProvider
+from broker.requester_history import RequesterHistoryReader
 from broker.user_directory import DatabaseUserDirectory
 
 
 def build_broker(db_path: str, triage: str = "mock", sidecar_url: Optional[str] = None) -> Broker:
     """Wires the real decision pipeline: user_roles -> ACL ceiling -> triage
-    -> DecisionRouter. Only the triage backend and the resource connector are
+    -> PolicyEngine. Only the triage backend and the resource connector are
     swappable from the command line; the routing logic itself is fixed."""
     db = Database(db_path)
     triage_provider = ClaudeTriageProvider() if triage == "claude" else MockTriageProvider()
-    policy = DecisionRouter(
+    policy = PolicyEngine(
         user_directory=DatabaseUserDirectory(db),
         acl_engine=AclPolicyEngine(db),
         triage_provider=triage_provider,
+        # The requester's own record in this same SQLite file: newcomers'
+        # large-scope requests and anyone recently denied/revoked go to a
+        # human regardless of the triage verdict (see PolicyEngine docstring).
+        history_reader=RequesterHistoryReader(db),
     )
     connector = HttpResourceConnector(sidecar_url) if sidecar_url else MockConnector()
     return Broker(db=db, policy=policy, connector=connector)
@@ -40,6 +46,15 @@ def _require_grant(broker: Broker, grant_id: int):
     if grant is None:
         print(f"error: no such grant {grant_id}")
     return grant
+
+
+def _print_pending(args, pending: PendingApproval) -> None:
+    """The PENDING_HUMAN block, identical whether the router or an
+    escalation put the request in front of a reviewer."""
+    print("status: PENDING_HUMAN")
+    print(f"approval_token: {pending.approval_token}")
+    print(f"approval_url: {args.approval_base_url}/approve/{pending.approval_token}")
+    print(f"deadline_at: {pending.deadline_at}")
 
 
 def cmd_request(args, broker: Broker) -> int:
@@ -55,12 +70,26 @@ def cmd_request(args, broker: Broker) -> int:
         print(f"status: {e.decision.decision.value}")
         print(f"detail: {e.decision.reason}")
         return 1
+    except ReturnedToRequesterError as e:
+        # Exit 1 like a deny (no access was granted), but the output says
+        # what the requester can do about it -- including the exact command
+        # to escalate this very request if they think a human should see it.
+        print("status: RETURNED")
+        print(f"request_id: {e.request_id}")
+        print(f"detail: {e.decision.reason}")
+        print(f"hint: {e.hint}")
+        print(f'escalate_with: python -m broker.cli --db {args.db} escalate {e.request_id} --by {args.requester} --note "..."')
+        return 1
+    except DuplicateRequestError as e:
+        print("status: DUPLICATE")
+        print(f"detail: {e}")
+        if e.existing_grant is not None:
+            print(f"existing_grant_id: {e.existing_grant.id}")
+        else:
+            print(f"existing_approval_token: {e.existing_pending.approval_token}")
+        return 1
     except PendingHumanReviewError as e:
-        pending = e.pending_approval
-        print("status: PENDING_HUMAN")
-        print(f"approval_token: {pending.approval_token}")
-        print(f"approval_url: {args.approval_base_url}/approve/{pending.approval_token}")
-        print(f"deadline_at: {pending.deadline_at}")
+        _print_pending(args, e.pending_approval)
         return 0
 
     print(f"status: {grant.status.value}")
@@ -94,22 +123,64 @@ def cmd_revoke(args, broker: Broker) -> int:
 
 
 def cmd_sweep(args, broker: Broker) -> int:
-    expired_count = broker.sweep_expired()
-    timed_out_count = broker.sweep_pending_timeouts()
-    print(f"expired_count: {expired_count}")
-    print(f"timed_out_count: {timed_out_count}")
-    return 0
+    """One reconcile pass by default. --loop keeps going every --interval
+    seconds (the docker-compose `sweeper` service runs this way) so expired
+    grants get torn down on the connector and stale approvals get auto-denied
+    without waiting for someone to run `sweep` by hand. --iterations bounds
+    the loop, mainly so tests can drive it."""
+    passes = 0
+    while True:
+        expired_count, timed_out_count = broker.reconcile()
+        print(f"expired_count: {expired_count}")
+        print(f"timed_out_count: {timed_out_count}")
+        passes += 1
+        if not args.loop or (args.iterations is not None and passes >= args.iterations):
+            return 0
+        sys.stdout.flush()
+        time.sleep(args.interval)
 
 
 def cmd_approve(args, broker: Broker) -> int:
     resolution = broker.resolve_approval(args.token, approve=(args.decision == "approve"), decided_by=args.by)
     print(f"resolved: {'true' if resolution.resolved else 'false'}")
     if not resolution.resolved:
-        print("detail: token unknown or already resolved")
+        print(f"detail: {resolution.reason}")
         return 1
     if resolution.grant is not None:
         print(f"grant_id: {resolution.grant.id}")
         print(f"token: {resolution.grant.token}")
+    return 0
+
+
+def cmd_escalate(args, broker: Broker) -> int:
+    """The requester's answer to a RETURNED request when they believe a
+    human should see it anyway. Only the requester can escalate, and only a
+    RETURNED request -- everything else is one generic error so the command
+    can't be used to probe which request ids exist or whose they are."""
+    pending = broker.escalate(args.request_id, note=args.note, requested_by=args.by)
+    if pending is None:
+        print(f"error: request {args.request_id} cannot be escalated (not found, not returned, or not yours)")
+        return 1
+    _print_pending(args, pending)
+    return 0
+
+
+def cmd_show_request(args, broker: Broker) -> int:
+    """Shows a request row and where it ended up. Requests that never
+    produced a grant or a pending approval (DENIED, DUPLICATE) have no other
+    object to inspect, so this is the only way to see their outcome."""
+    request = broker.db.get_request(args.request_id)
+    if request is None:
+        print(f"error: no such request {args.request_id}")
+        return 1
+    print(f"request_id: {request.id}")
+    print(f"requester: {request.requester}")
+    print(f"resource: {request.resource}")
+    print(f"access_level: {request.access_level}")
+    print(f"duration_seconds: {request.duration_seconds}")
+    print(f"reason: {request.reason}")
+    print(f"status: {request.status.value}")
+    print(f"created_at: {request.created_at}")
     return 0
 
 
@@ -122,15 +193,19 @@ def cmd_audit(args, broker: Broker) -> int:
 
 
 def cmd_load_acl(args, broker: Broker) -> int:
-    """Syncs the human-authored acl.yaml into the acl_rules table. Admin
-    operation, not a requester action, so it deliberately writes no audit
-    events -- the audit log records access decisions, not config syncs."""
+    """Syncs the human-authored acl.yaml into the acl_rules and
+    approver_roles tables. Admin operation, not a requester action, so it
+    deliberately writes no audit events -- the audit log records access
+    decisions, not config syncs."""
     if not os.path.exists(args.path):
         print(f"error: no such file {args.path}")
         return 1
     rules = load_acl_yaml(args.path)
+    approver_roles = load_approver_roles(args.path)
     broker.db.load_acl_rules(rules)
+    broker.db.load_approver_roles(approver_roles)
     print(f"rules_loaded: {len(rules)}")
+    print(f"approver_roles_loaded: {len(approver_roles)}")
     return 0
 
 
@@ -177,8 +252,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_revoke.add_argument("--by", required=True, help="who is revoking it")
     p_revoke.set_defaults(func=cmd_revoke)
 
-    p_sweep = sub.add_parser("sweep", help="expire any due grants")
+    p_sweep = sub.add_parser("sweep", help="expire due grants and time out stale pending approvals")
+    p_sweep.add_argument("--loop", action="store_true", help="keep sweeping every --interval seconds instead of once")
+    p_sweep.add_argument("--interval", type=int, default=30, help="seconds between passes in --loop mode (default 30)")
+    p_sweep.add_argument("--iterations", type=int, default=None, help="stop --loop after this many passes (default: forever)")
     p_sweep.set_defaults(func=cmd_sweep)
+
+    p_show_request = sub.add_parser("show-request", help="show a request and its current status")
+    p_show_request.add_argument("request_id", type=int)
+    p_show_request.set_defaults(func=cmd_show_request)
 
     p_audit = sub.add_parser("audit", help="show audit log entries")
     p_audit.add_argument("--request-id", type=int, default=None)
@@ -187,11 +269,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_approve = sub.add_parser("approve", help="resolve a pending human-review approval")
     p_approve.add_argument("token")
-    p_approve.add_argument("--by", required=True, help="who is deciding")
+    p_approve.add_argument("--by", required=True, help="who is deciding (must be a known user holding an approver role)")
     p_approve.add_argument("--decision", choices=["approve", "deny"], required=True)
     p_approve.set_defaults(func=cmd_approve)
 
-    p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules table")
+    p_escalate = sub.add_parser("escalate", help="send a request the AI returned to you to a human reviewer instead")
+    p_escalate.add_argument("request_id", type=int)
+    p_escalate.add_argument("--by", required=True, help="who is escalating (must be the requester)")
+    p_escalate.add_argument("--note", required=True, help="what the reviewer should know that the original reason didn't say")
+    p_escalate.set_defaults(func=cmd_escalate)
+
+    p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules and approver roles tables")
     p_load_acl.add_argument("path", help="path to the acl.yaml file")
     p_load_acl.set_defaults(func=cmd_load_acl)
 

@@ -15,6 +15,16 @@
 # Known limitation: if a role has multiple rules whose resource_pattern both
 # match a requested resource, the first matching rule (in file/table order)
 # wins. Overlapping rules for the same role are not otherwise reconciled.
+#
+# approver_roles: which roles may decide a pending human review (approve OR
+# deny). Synced into the approver_roles table by the same load-acl step and
+# checked by Broker.resolve_approval: the decider must be a user in
+# user_roles whose role is listed here. Absent or empty => nobody can
+# approve (fail closed). This authorizes a *claimed* name -- the approval
+# page has no login yet, so it stops a typo or a stranger from approving,
+# not a deliberate impersonation. SSO on the approval page is the next step.
+approver_roles: [security, oncall]
+
 roles:
   engineer:
     - resource_pattern: "prod-db"
@@ -30,3 +40,12 @@ roles:
     - resource_pattern: "staging-*"
       max_access_level: read
       max_duration_seconds: 1800
+
+  # Reviewers. Listed under roles too so every role named in approver_roles
+  # is a role the ACL knows about; the rule itself is deliberately narrow
+  # (read-only, one hour, any resource) -- approving is their job, not
+  # holding broad standing access.
+  security:
+    - resource_pattern: "*"
+      max_access_level: read
+      max_duration_seconds: 3600
