@@ -117,13 +117,15 @@ def test_expired_grant_cannot_be_revoked(tmp_path):
     clock.advance(61)
     broker.sweep_expired()
     assert db.get_grant(grant.id).status == GrantStatus.EXPIRED
+    # expiry itself tears down the external grant exactly once
+    assert connector.revoked == [(grant.resource, grant.access_level, grant.token)]
 
     broker.revoke(grant.id, revoked_by="security-team")
 
-    # still EXPIRED, not flipped to REVOKED, and the connector was never
-    # asked to revoke a token that's already dead
+    # still EXPIRED, not flipped to REVOKED, and the connector was NOT asked
+    # to revoke a second time for a token that's already dead
     assert db.get_grant(grant.id).status == GrantStatus.EXPIRED
-    assert connector.revoked == []
+    assert connector.revoked == [(grant.resource, grant.access_level, grant.token)]
 
 
 def test_service_restart_recovers_state_from_db(tmp_path):

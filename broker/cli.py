@@ -2,17 +2,35 @@
 via --db, so state is shared across separate process invocations exactly
 the way a real CLI is used -- this is not an in-memory demo harness."""
 import argparse
+import os
 import sys
+from typing import Optional
 
+from broker.acl_loader import load_acl_yaml
+from broker.acl_policy import AclPolicyEngine
 from broker.broker import Broker
 from broker.connector import MockConnector
 from broker.db import Database
-from broker.models import AccessDeniedError
-from broker.policy import AlwaysApprovePolicy
+from broker.decision_router import DecisionRouter
+from broker.http_connector import HttpResourceConnector
+from broker.models import AccessDeniedError, PendingHumanReviewError
+from broker.triage import ClaudeTriageProvider, MockTriageProvider
+from broker.user_directory import DatabaseUserDirectory
 
 
-def build_broker(db_path: str) -> Broker:
-    return Broker(db=Database(db_path), policy=AlwaysApprovePolicy(), connector=MockConnector())
+def build_broker(db_path: str, triage: str = "mock", sidecar_url: Optional[str] = None) -> Broker:
+    """Wires the real decision pipeline: user_roles -> ACL ceiling -> triage
+    -> DecisionRouter. Only the triage backend and the resource connector are
+    swappable from the command line; the routing logic itself is fixed."""
+    db = Database(db_path)
+    triage_provider = ClaudeTriageProvider() if triage == "claude" else MockTriageProvider()
+    policy = DecisionRouter(
+        user_directory=DatabaseUserDirectory(db),
+        acl_engine=AclPolicyEngine(db),
+        triage_provider=triage_provider,
+    )
+    connector = HttpResourceConnector(sidecar_url) if sidecar_url else MockConnector()
+    return Broker(db=db, policy=policy, connector=connector)
 
 
 def _require_grant(broker: Broker, grant_id: int):
@@ -37,6 +55,13 @@ def cmd_request(args, broker: Broker) -> int:
         print(f"status: {e.decision.decision.value}")
         print(f"detail: {e.decision.reason}")
         return 1
+    except PendingHumanReviewError as e:
+        pending = e.pending_approval
+        print("status: PENDING_HUMAN")
+        print(f"approval_token: {pending.approval_token}")
+        print(f"approval_url: {args.approval_base_url}/approve/{pending.approval_token}")
+        print(f"deadline_at: {pending.deadline_at}")
+        return 0
 
     print(f"status: {grant.status.value}")
     print(f"grant_id: {grant.id}")
@@ -69,8 +94,22 @@ def cmd_revoke(args, broker: Broker) -> int:
 
 
 def cmd_sweep(args, broker: Broker) -> int:
-    count = broker.sweep_expired()
-    print(f"expired_count: {count}")
+    expired_count = broker.sweep_expired()
+    timed_out_count = broker.sweep_pending_timeouts()
+    print(f"expired_count: {expired_count}")
+    print(f"timed_out_count: {timed_out_count}")
+    return 0
+
+
+def cmd_approve(args, broker: Broker) -> int:
+    resolution = broker.resolve_approval(args.token, approve=(args.decision == "approve"), decided_by=args.by)
+    print(f"resolved: {'true' if resolution.resolved else 'false'}")
+    if not resolution.resolved:
+        print("detail: token unknown or already resolved")
+        return 1
+    if resolution.grant is not None:
+        print(f"grant_id: {resolution.grant.id}")
+        print(f"token: {resolution.grant.token}")
     return 0
 
 
@@ -82,9 +121,43 @@ def cmd_audit(args, broker: Broker) -> int:
     return 0
 
 
+def cmd_load_acl(args, broker: Broker) -> int:
+    """Syncs the human-authored acl.yaml into the acl_rules table. Admin
+    operation, not a requester action, so it deliberately writes no audit
+    events -- the audit log records access decisions, not config syncs."""
+    if not os.path.exists(args.path):
+        print(f"error: no such file {args.path}")
+        return 1
+    rules = load_acl_yaml(args.path)
+    broker.db.load_acl_rules(rules)
+    print(f"rules_loaded: {len(rules)}")
+    return 0
+
+
+def cmd_set_role(args, broker: Broker) -> int:
+    """Assigns a requester's role. Stands in for the IdP group sync a real
+    deployment would run; like load-acl it is config, not an access event."""
+    broker.db.set_user_role(args.requester, args.role)
+    print(f"requester: {args.requester}")
+    print(f"role: {args.role}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="broker")
     parser.add_argument("--db", default="broker.db", help="path to the SQLite database file")
+    parser.add_argument("--approval-base-url", default="http://localhost:8083", help="base URL where the approval web service is reachable")
+    parser.add_argument(
+        "--triage",
+        choices=["mock", "claude"],
+        default="mock",
+        help="AI triage backend: mock (deterministic heuristic, default) or claude (real Anthropic API, needs ANTHROPIC_API_KEY)",
+    )
+    parser.add_argument(
+        "--sidecar-url",
+        default=None,
+        help="if set, issue/revoke grants against the fake Okta sidecar at this URL instead of the in-process mock",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_request = sub.add_parser("request", help="request time-boxed access")
@@ -112,13 +185,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("--grant-id", type=int, default=None)
     p_audit.set_defaults(func=cmd_audit)
 
+    p_approve = sub.add_parser("approve", help="resolve a pending human-review approval")
+    p_approve.add_argument("token")
+    p_approve.add_argument("--by", required=True, help="who is deciding")
+    p_approve.add_argument("--decision", choices=["approve", "deny"], required=True)
+    p_approve.set_defaults(func=cmd_approve)
+
+    p_load_acl = sub.add_parser("load-acl", help="sync an acl.yaml file into the ACL rules table")
+    p_load_acl.add_argument("path", help="path to the acl.yaml file")
+    p_load_acl.set_defaults(func=cmd_load_acl)
+
+    p_set_role = sub.add_parser("set-role", help="assign a role to a requester")
+    p_set_role.add_argument("requester")
+    p_set_role.add_argument("role")
+    p_set_role.set_defaults(func=cmd_set_role)
+
     return parser
 
 
 def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    broker = build_broker(args.db)
+    broker = build_broker(args.db, triage=args.triage, sidecar_url=args.sidecar_url)
     return args.func(args, broker)
 
 

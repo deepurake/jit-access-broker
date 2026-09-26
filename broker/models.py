@@ -22,6 +22,17 @@ class AuditEventType(str, Enum):
     DENIED = "DENIED"
     EXPIRED = "EXPIRED"
     REVOKED = "REVOKED"
+    ROUTED_TO_HUMAN = "ROUTED_TO_HUMAN"
+    HUMAN_APPROVED = "HUMAN_APPROVED"
+    HUMAN_DENIED = "HUMAN_DENIED"
+    APPROVAL_TIMEOUT = "APPROVAL_TIMEOUT"
+
+
+class PendingApprovalStatus(str, Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    DENIED = "DENIED"
+    TIMED_OUT = "TIMED_OUT"
 
 
 @dataclass
@@ -61,3 +72,47 @@ class AuditEvent:
     event_type: AuditEventType
     detail: str
     at: int
+
+
+@dataclass
+class PendingApproval:
+    id: int
+    request_id: int
+    approval_token: str
+    status: PendingApprovalStatus
+    created_at: int
+    deadline_at: int
+    decided_at: Optional[int]
+    decided_by: Optional[str]
+
+
+@dataclass
+class Request:
+    id: int
+    requester: str
+    resource: str
+    access_level: str
+    duration_seconds: int
+    reason: str
+    created_at: int
+
+
+class PendingHumanReviewError(Exception):
+    """Raised by Broker.request_access when the policy engine routes the
+    request to a human instead of deciding it outright. Carries the
+    PendingApproval (with its single-use approval_token) so callers (e.g.
+    the CLI) can surface the review link instead of a grant."""
+
+    def __init__(self, pending_approval: "PendingApproval"):
+        super().__init__(f"routed to human review, token={pending_approval.approval_token}")
+        self.pending_approval = pending_approval
+
+
+@dataclass
+class ApprovalResolution:
+    """Result of resolving a pending approval. `resolved` distinguishes
+    'this call actually changed something' from 'no-op, already decided or
+    unknown token' -- callers need that distinction even for a deny (which
+    has no Grant to return either way)."""
+    resolved: bool
+    grant: "Optional[Grant]"

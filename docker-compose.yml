@@ -1,0 +1,46 @@
+services:
+  okta-sidecar:
+    build:
+      context: .
+      dockerfile: sidecar/Dockerfile
+    ports:
+      - "8081:8081"
+
+  protected-resource:
+    build:
+      context: .
+      dockerfile: protected_service/Dockerfile
+    environment:
+      SIDECAR_URL: http://okta-sidecar:8081
+    ports:
+      - "8082:8082"
+    depends_on:
+      - okta-sidecar
+
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      SIDECAR_URL: http://okta-sidecar:8081
+      PROTECTED_SERVICE_URL: http://protected-resource:8082
+    depends_on:
+      - okta-sidecar
+      - protected-resource
+
+  approval-service:
+    build:
+      context: .
+      dockerfile: approval_service/Dockerfile
+    environment:
+      BROKER_DB: /data/broker.db
+      SIDECAR_URL: http://okta-sidecar:8081
+    ports:
+      - "8083:8083"
+    volumes:
+      - broker-data:/data
+    depends_on:
+      - okta-sidecar
+
+volumes:
+  broker-data: {}
